@@ -1,3 +1,5 @@
+import { useEffect } from "react"
+import { getCurrentWindow } from "@tauri-apps/api/window"
 import { useWorkflow } from "@/hooks/useWorkflow"
 import { useSetupGate } from "@/hooks/useSetupGate"
 import { loadLastRepo } from "@/lib/repo"
@@ -9,6 +11,15 @@ function App() {
   const wf = useWorkflow(loadLastRepo())
   const setup = useSetupGate(wf.repoPath)
   const ready = setup.state?.phase === "ready"
+
+  // Window titlebar: "vcflow v0.1.0 — feature/foo" (branch appended once known).
+  const branch = wf.status?.branch
+  useEffect(() => {
+    const base = `vcflow v${__APP_VERSION__}`
+    void getCurrentWindow()
+      .setTitle(branch ? `${base} — ${branch}` : base)
+      .catch(() => {})
+  }, [branch])
 
   return (
     <main className="mx-auto flex min-h-svh w-full max-w-xl flex-col gap-4 p-6">
