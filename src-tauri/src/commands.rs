@@ -696,6 +696,15 @@ pub async fn finish_work_item(
         log.set_status(&repo_path, &branch, "waiting").ok();
     }
     audit_best_effort(&repo_path, "finish_work_item", &branch, Some(&mr.id));
+
+    // MR is open; nothing more to do on the work branch. Park the user back on
+    // develop. Best-effort: the tree is clean here (Finish is only offered when
+    // committed) and the checkout is safe, but a missing local develop must not
+    // fail a finish whose MR already succeeded.
+    let _ = run_git(&repo_path, "checkout", "develop", || {
+        git_core::checkout_branch(&repo, "develop")
+    });
+
     build_and_emit_status(&app, &repo_path).await
 }
 
@@ -801,6 +810,12 @@ pub async fn finish_hotfix(
     }
     audit_best_effort(&repo_path, "finish_hotfix", &branch, Some(&prod_mr.id));
     audit_best_effort(&repo_path, "finish_hotfix", &branch, Some(&sync_mr.id));
+
+    // Both MRs are open; park the user back on develop. Best-effort -- see
+    // finish_work_item.
+    let _ = run_git(&repo_path, "checkout", "develop", || {
+        git_core::checkout_branch(&repo, "develop")
+    });
 
     let status = build_and_emit_status(&app, &repo_path).await?;
     Ok(RepoStatusWithPath { status, repo_path })
