@@ -656,6 +656,14 @@ pub async fn push_work_item(app: AppHandle, repo_path: String) -> Result<RepoSta
     run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch)).map_err(|e| e.to_string())?;
 
     audit_best_effort(&repo_path, "push_work_item", &branch, None);
+
+    // This runs only for follow-up commits onto an already-open MR (the Push
+    // next-action). The MR now has everything -- park the user back on develop.
+    // Best-effort -- see finish_work_item.
+    let _ = run_git(&repo_path, "checkout", "develop", || {
+        git_core::checkout_branch(&repo, "develop")
+    });
+
     build_and_emit_status(&app, &repo_path).await
 }
 
