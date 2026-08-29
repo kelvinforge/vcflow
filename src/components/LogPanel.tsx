@@ -11,6 +11,11 @@ import { Button, ErrorLine } from "@/components/ui"
 // the backend appends these, staleness between reloads is harmless.
 const LIMIT = 50
 
+/** RFC3339 -> local "HH:MM:SS" (24h). Date dropped — logs are same-session. */
+const hms = (ts: string) => new Date(ts).toTimeString().slice(0, 8)
+/** ms -> "992ms" / "2.7s". */
+const dur = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`)
+
 function useLog<T>(load: () => Promise<T[]>) {
   const [rows, setRows] = useState<T[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -64,8 +69,8 @@ export function CommandLogPanel({ repoPath }: { repoPath: string }) {
       error={error}
       reload={reload}
       render={(r: CommandLogDto) =>
-        `${r.timestamp} · ${r.operation} · ${r.outcome} · ${r.duration_ms}ms` +
-        (r.error ? ` · ${r.error}` : "")
+        `${hms(r.timestamp)}  ${r.operation}  ${r.outcome}  ${dur(r.duration_ms)}` +
+        (r.error ? `  ${r.error}` : "")
       }
     />
   )
@@ -80,8 +85,8 @@ export function AuditLogPanel() {
       error={error}
       reload={reload}
       render={(r: AuditEntryDto) =>
-        `${r.timestamp} · ${r.user} · ${r.branch ?? "-"} · ${r.action} · ${r.result}` +
-        (r.error ? ` · ${r.error}` : "")
+        `${hms(r.timestamp)}  ${r.user}  ${r.branch ?? "-"}  ${r.action}  ${r.result}` +
+        (r.error ? `  ${r.error}` : "")
       }
     />
   )
