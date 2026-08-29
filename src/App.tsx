@@ -12,7 +12,10 @@ function App() {
 
   return (
     <main className="mx-auto flex min-h-svh w-full max-w-xl flex-col gap-4 p-6">
-      <h1 className="text-lg font-semibold text-foreground">vcflow</h1>
+      <h1 className="flex items-baseline gap-2 text-lg font-semibold text-foreground">
+        vcflow
+        <span className="text-xs font-normal text-muted-foreground">v{__APP_VERSION__}</span>
+      </h1>
 
       <RepoHeader
         key={wf.repoPath}
