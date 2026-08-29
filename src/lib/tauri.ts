@@ -369,6 +369,13 @@ export function openUrl(url: string): Promise<void> {
   return invoke<void>("open_url", { url })
 }
 
+/** Native OS folder picker. Returns the chosen path, or null if cancelled. */
+export async function pickRepo(): Promise<string | null> {
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const picked = await open({ directory: true, multiple: false })
+  return typeof picked === "string" ? picked : null
+}
+
 // --- Setup gate (Preflight + Initial Workflow, in front of the workflow) ---
 
 export type SetupPhase =
