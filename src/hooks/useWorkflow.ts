@@ -160,6 +160,12 @@ export function useWorkflow(initialRepoPath: string): WorkflowState {
     try {
       const s = await refreshRepoStatus(repo)
       applyStatus(repo, s)
+      // "Refreshed Xm ago" tracks the origin fetch, which always runs here --
+      // refreshSnapshot can gen-drop under a race and never reach its own set.
+      if (repoRef.current === repo) {
+        lastRefreshedRef.current = Date.now()
+        setLastRefreshed(lastRefreshedRef.current)
+      }
       // Fallback path: nudge self-owned panels (WorkPanel) so the 15s loop
       // still retires merged/deleted branches even with no backend event.
       bumpTick()
