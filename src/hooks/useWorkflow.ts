@@ -240,6 +240,9 @@ export function useWorkflow(initialRepoPath: string): WorkflowState {
     setHotfix(null)
     setError(null)
     setLastRefreshed(null)
+    // Inspection is per-repo: never carry repo A's parked-branch session to B.
+    setInspection(null)
+    inspectingRef.current = false
     setRepoPathState(trimmed)
   }, [])
 
