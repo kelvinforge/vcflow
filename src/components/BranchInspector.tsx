@@ -1,8 +1,7 @@
 import { useState } from "react"
-import { Eye } from "lucide-react"
 import type { InspectionMode } from "@/hooks/useWorkflow"
 import type { InspectTarget } from "@/lib/tauri"
-import { Button, Card, ErrorLine } from "@/components/ui"
+import { Button, ErrorLine, Help } from "@/components/ui"
 
 // Auxiliary action, not a workflow surface. Temporarily parks on develop or the
 // production branch via Work Safe so client feedback can be checked without a
@@ -32,40 +31,37 @@ export function BranchInspector({
   }
 
   return (
-    <Card>
-      <div className="flex h-full flex-col gap-2">
-        <p className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
-          <Eye size={15} /> Inspect
-        </p>
-        <p className="flex-1 text-xs text-muted-foreground">
-          Peek at <code>develop</code> or <code>{productionBranch ?? "main"}</code> from any branch.
-          Current work is saved first; use <span className="font-medium">Return</span> to come back.
-        </p>
-        {inspection ? (
-          <Button disabled={busy} className="w-full" onClick={() => run(onReturn)}>
+    <div className="flex flex-wrap items-center gap-2">
+      {inspection ? (
+        <>
+          <Button disabled={busy} onClick={() => run(onReturn)}>
             {busy ? "Returning…" : `Return to ${inspection.originalBranch}`}
           </Button>
-        ) : (
-          <div className="flex flex-col gap-2">
-            {targets.filter((t) => t !== currentBranch).map((t) => (
-              <Button
-                key={t}
-                className="w-full"
-                disabled={busy || !currentBranch}
-                onClick={() => run(() => onInspect(t))}
-              >
-                {busy ? "…" : t}
-              </Button>
-            ))}
-          </div>
-        )}
-        {inspection && (
-          <p className="text-xs text-muted-foreground">
-            Inspecting <span className="font-medium text-foreground">{inspection.target}</span>.
-          </p>
-        )}
-        {error && <ErrorLine error={error} />}
-      </div>
-    </Card>
+          <span className="text-xs text-muted-foreground">
+            Inspecting <span className="font-medium text-foreground">{inspection.target}</span>
+          </span>
+        </>
+      ) : (
+        <span className="inline-flex items-center gap-1">
+          <select
+            className="rounded border border-border bg-transparent px-2 py-1 text-xs disabled:opacity-50"
+            value=""
+            disabled={busy || !currentBranch}
+            onChange={(e) => e.target.value && run(() => onInspect(e.target.value as InspectTarget))}
+          >
+            <option value="">{busy ? "Inspecting…" : "Inspect branch…"}</option>
+            {targets
+              .filter((t) => t !== currentBranch)
+              .map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+          </select>
+          <Help text={`Inspect: peek at develop or ${productionBranch ?? "main"} from any branch. Current work is saved first; use Return to come back.`} />
+        </span>
+      )}
+      {error && <ErrorLine error={error} />}
+    </div>
   )
 }

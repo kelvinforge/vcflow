@@ -51,6 +51,20 @@ export function ExistingWorkflow({ wf }: { wf: WorkflowState }) {
     <>
       {wf.error && <ErrorLine error={wf.error} onRetry={wf.refreshNow} />}
 
+      <StartPanel
+        repoPath={wf.repoPath}
+        onChanged={wf.refreshNow}
+        extra={
+          <BranchInspector
+            currentBranch={wf.status?.branch ?? null}
+            productionBranch={wf.status?.production_branch ?? null}
+            inspection={wf.inspection}
+            onInspect={wf.inspectBranch}
+            onReturn={wf.endInspection}
+          />
+        }
+      />
+
       {showWork ? (
         <Section title="Your work" defaultOpen>
           <WorkPanel repoPath={wf.repoPath} onChanged={wf.refreshNow} reloadSignal={wf.syncTick} />
@@ -74,20 +88,6 @@ export function ExistingWorkflow({ wf }: { wf: WorkflowState }) {
       )}
 
       {wf.status && <RepoStateStrip status={wf.status} />}
-
-      <StartPanel
-        repoPath={wf.repoPath}
-        onChanged={wf.refreshNow}
-        extra={
-          <BranchInspector
-            currentBranch={wf.status?.branch ?? null}
-            productionBranch={wf.status?.production_branch ?? null}
-            inspection={wf.inspection}
-            onInspect={wf.inspectBranch}
-            onReturn={wf.endInspection}
-          />
-        }
-      />
 
       <Section title="Review Handoff" defaultOpen>
         <MrPanel mr={wf.mr} hotfix={wf.hotfix} />
