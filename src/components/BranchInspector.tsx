@@ -4,22 +4,24 @@ import type { InspectionMode } from "@/hooks/useWorkflow"
 import type { InspectTarget } from "@/lib/tauri"
 import { Button, Card, ErrorLine } from "@/components/ui"
 
-// Auxiliary action, not a workflow surface. Temporarily parks on develop/master
-// via Work Safe so client feedback can be checked without a manual checkout,
-// then returns to the original branch.
-const TARGETS: InspectTarget[] = ["develop", "master"]
+// Auxiliary action, not a workflow surface. Temporarily parks on develop or the
+// production branch via Work Safe so client feedback can be checked without a
+// manual checkout, then returns to the original branch.
 
 export function BranchInspector({
   currentBranch,
+  productionBranch,
   inspection,
   onInspect,
   onReturn,
 }: {
   currentBranch: string | null
+  productionBranch: string | null
   inspection: InspectionMode | null
   onInspect: (target: InspectTarget) => Promise<string | null>
   onReturn: () => Promise<string | null>
 }) {
+  const targets = ["develop", productionBranch ?? "main"]
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -36,8 +38,8 @@ export function BranchInspector({
           <Eye size={15} /> Inspect
         </p>
         <p className="flex-1 text-xs text-muted-foreground">
-          Peek at <code>develop</code> or <code>master</code> from any branch. Current work is saved
-          first; use <span className="font-medium">Return</span> to come back.
+          Peek at <code>develop</code> or <code>{productionBranch ?? "main"}</code> from any branch.
+          Current work is saved first; use <span className="font-medium">Return</span> to come back.
         </p>
         {inspection ? (
           <Button disabled={busy} className="w-full" onClick={() => run(onReturn)}>
@@ -45,7 +47,7 @@ export function BranchInspector({
           </Button>
         ) : (
           <div className="flex flex-col gap-2">
-            {TARGETS.filter((t) => t !== currentBranch).map((t) => (
+            {targets.filter((t) => t !== currentBranch).map((t) => (
               <Button
                 key={t}
                 className="w-full"

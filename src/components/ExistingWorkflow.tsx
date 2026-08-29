@@ -54,6 +54,7 @@ export function ExistingWorkflow({ wf }: { wf: WorkflowState }) {
         extra={
           <BranchInspector
             currentBranch={wf.status?.branch ?? null}
+            productionBranch={wf.status?.production_branch ?? null}
             inspection={wf.inspection}
             onInspect={wf.inspectBranch}
             onReturn={wf.endInspection}

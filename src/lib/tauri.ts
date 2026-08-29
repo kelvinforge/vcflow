@@ -27,6 +27,8 @@ export interface RepoStatus {
   ahead: number
   behind: number
   diverged: boolean
+  /** The repo's production branch: "main" or "master", whichever exists. */
+  production_branch: string
 }
 
 export interface RepoStatusWithPath {
@@ -204,9 +206,11 @@ export function continueWork(repoPath: string, workItemId: number): Promise<Cont
   return invoke<ContinueOutcome>("continue_work", { repoPath, workItemId })
 }
 
-// --- Temporary branch inspection (develop / master) -----------------
+// --- Temporary branch inspection (develop / production branch) ----------
 
-export type InspectTarget = "develop" | "master"
+/** "develop" or the repo's production branch (main/master) — resolved at
+ *  runtime from RepoStatus.production_branch, not a fixed union. */
+export type InspectTarget = string
 
 export interface InspectionOutcome {
   status: RepoStatus

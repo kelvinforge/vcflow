@@ -19,15 +19,20 @@ pub enum HotfixError {
     NoWorkdir,
 }
 
-/// Creates `hotfix/<slug>` off local `master` and auto-bumps + commits the
-/// VERSION patch in one step -- no user confirm, unlike Release's bump.
+/// Creates `hotfix/<slug>` off the local production branch (`main` or `master`,
+/// caller-resolved) and auto-bumps + commits the VERSION patch in one step --
+/// no user confirm, unlike Release's bump.
 ///
-/// Assumes a clean working tree with `master` already fast-forwarded to
+/// Assumes a clean working tree with `production` already fast-forwarded to
 /// origin: the Tauri command layer runs the Work Safe guard and
 /// `fast_forward_from_origin` before calling this. No worktree isolation --
 /// Work Safe is the only safety layer.
-pub fn create_hotfix_branch(repo: &Repository, slug: &str) -> Result<String, HotfixError> {
-    let branch_name = create_work_branch(repo, BranchKind::Hotfix, slug, "master")?;
+pub fn create_hotfix_branch(
+    repo: &Repository,
+    slug: &str,
+    production: &str,
+) -> Result<String, HotfixError> {
+    let branch_name = create_work_branch(repo, BranchKind::Hotfix, slug, production)?;
     bump_and_commit(repo)?;
     Ok(branch_name)
 }
@@ -67,7 +72,7 @@ mod tests {
         run(dir.path(), &["commit", "-m", "init"]);
 
         let repo = Repository::open(dir.path()).unwrap();
-        let branch_name = create_hotfix_branch(&repo, "urgent-fix").unwrap();
+        let branch_name = create_hotfix_branch(&repo, "urgent-fix", "master").unwrap();
         assert_eq!(branch_name, "hotfix/urgent-fix");
 
         let head = repo.head().unwrap();

@@ -51,6 +51,19 @@ pub struct RepoStatus {
     pub behind: usize,
     /// Local and remote both carry unique commits -- never auto-resolved.
     pub diverged: bool,
+
+    /// The repo's production branch: `main` (GitHub default) or `master`
+    /// (GitLab default), whichever this repo actually has. `main` when neither
+    /// exists yet. The frontend uses this for branch-inspection targets instead
+    /// of assuming `master`.
+    pub production_branch: String,
+}
+
+/// Resolve the repo's production branch (`main`/`master`), erroring when the
+/// repo has neither -- a hard STOP for hotfix and inspection flows.
+fn resolve_production(repo: &Repository) -> Result<String, String> {
+    git_core::production_branch(repo)
+        .ok_or_else(|| "this repository has no 'main' or 'master' branch".to_string())
 }
 
 /// A `RepoStatus` plus the repo path it describes -- returned by the Hotfix
@@ -722,19 +735,20 @@ pub async fn create_hotfix(
     slug: String,
 ) -> Result<RepoStatusWithPath, String> {
     let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let production = resolve_production(&repo)?;
     guard_working_tree(&repo_path, &mut repo, &format!("creating hotfix/{slug}"))?;
 
-    // Bring local `master` current before branching off it. Fetch is
-    // best-effort; a real divergence is a hard STOP (Work Safe -- never
+    // Bring the local production branch current before branching off it. Fetch
+    // is best-effort; a real divergence is a hard STOP (Work Safe -- never
     // reconciled for the user).
     let _ = git_core::fetch_origin(&repo);
-    run_git(&repo_path, "fast_forward", "master", || {
-        git_core::fast_forward_from_origin(&repo, "master")
+    run_git(&repo_path, "fast_forward", &production, || {
+        git_core::fast_forward_from_origin(&repo, &production)
     })
     .map_err(|e| e.to_string())?;
 
     let branch_name = run_git(&repo_path, "create_hotfix_branch", &slug, || {
-        git_core::create_hotfix_branch(&repo, &slug)
+        git_core::create_hotfix_branch(&repo, &slug, &production)
     })
     .map_err(|e| e.to_string())?;
 
@@ -746,8 +760,9 @@ pub async fn create_hotfix(
     Ok(RepoStatusWithPath { status, repo_path })
 }
 
-/// Opens the `hotfix/* -> master` MR, then a separate `master -> develop`
-/// sync MR so the hotfix lands back on develop. Each MR is tracked and
+/// Opens the `hotfix/* -> <production>` MR, then a separate
+/// `<production> -> develop` sync MR so the hotfix lands back on develop.
+/// `<production>` is the repo's `main`/`master`. Each MR is tracked and
 /// merged independently -- no automatic merge, no worktree.
 #[tauri::command]
 pub async fn finish_hotfix(
@@ -756,6 +771,7 @@ pub async fn finish_hotfix(
     title: String,
 ) -> Result<RepoStatusWithPath, String> {
     let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let production = resolve_production(&repo)?;
     let branch = current_branch(&repo)?;
     run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch)).map_err(|e| e.to_string())?;
 
@@ -767,23 +783,23 @@ pub async fn finish_hotfix(
         .await
         .ok_or("could not reach the provider API for this remote (check token/host)")?;
 
-    let master_mr = client
-        .create_merge_request(&branch, "master", &title)
+    let prod_mr = client
+        .create_merge_request(&branch, &production, &title)
         .await
         .map_err(|e| e.to_string())?;
     let sync_mr = client
-        .create_merge_request("master", "develop", &format!("sync: {title}"))
+        .create_merge_request(&production, "develop", &format!("sync: {title}"))
         .await
         .map_err(|e| e.to_string())?;
 
     if let Some(log) = work_item_log() {
-        log.add_mr(&repo_path, &branch, "master", &master_mr.id).ok();
+        log.add_mr(&repo_path, &branch, &production, &prod_mr.id).ok();
         log.add_mr(&repo_path, &branch, "develop", &sync_mr.id).ok();
     }
     if let Some(log) = wip_item_log() {
         log.set_status(&repo_path, &branch, "waiting").ok();
     }
-    audit_best_effort(&repo_path, "finish_hotfix", &branch, Some(&master_mr.id));
+    audit_best_effort(&repo_path, "finish_hotfix", &branch, Some(&prod_mr.id));
     audit_best_effort(&repo_path, "finish_hotfix", &branch, Some(&sync_mr.id));
 
     let status = build_and_emit_status(&app, &repo_path).await?;
@@ -811,14 +827,15 @@ pub async fn get_hotfix_status(repo_path: String) -> Result<Option<HotfixStatus>
         return Ok(None);
     };
 
+    let production = resolve_production(&repo)?;
     let mut master = None;
     let mut develop = None;
     for mr_ref in mrs {
         let status = fetch_mr_status(&client, &mr_ref.mr_iid).await.map_err(|e| e.to_string())?;
-        match mr_ref.target_branch.as_str() {
-            "master" => master = Some(status),
-            "develop" => develop = Some(status),
-            _ => {}
+        if mr_ref.target_branch == "develop" {
+            develop = Some(status);
+        } else if mr_ref.target_branch == production {
+            master = Some(status);
         }
     }
 
@@ -871,8 +888,13 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
 
     let role = resolve_workflow_role(&repo_path).await;
 
-    // A work item's MR targets develop; a hotfix's primary MR targets master.
-    let primary_target = if class == BranchClass::Hotfix { "master" } else { "develop" };
+    // A work item's MR targets develop; a hotfix's primary MR targets the
+    // production branch (main/master).
+    let primary_target = if class == BranchClass::Hotfix {
+        resolve_production(&repo)?
+    } else {
+        "develop".to_string()
+    };
     let tracked_mr = work_item_log()
         .and_then(|log| log.mrs_for_branch(&repo_path, &branch).ok())
         .unwrap_or_default()
@@ -1033,9 +1055,14 @@ async fn build_status(repo_path: &str) -> Result<RepoStatus, String> {
 
     // Work Safe read-only state -- best-effort; a repo we can't inspect
     // (detached HEAD, unreadable) just reports the safe-looking default.
-    let ws = Repository::discover(repo_path)
-        .ok()
-        .and_then(|repo| git_core::read_repository_state(&repo).ok());
+    let repo_handle = Repository::discover(repo_path).ok();
+    let production_branch = repo_handle
+        .as_ref()
+        .and_then(git_core::production_branch)
+        .unwrap_or_else(|| "main".to_string());
+    let ws = repo_handle
+        .as_ref()
+        .and_then(|repo| git_core::read_repository_state(repo).ok());
     let (dirty, dirty_count, in_progress_op, ahead, behind, diverged) = match ws {
         Some(s) => {
             let up = s.upstream.unwrap_or_default();
@@ -1067,6 +1094,7 @@ async fn build_status(repo_path: &str) -> Result<RepoStatus, String> {
         ahead,
         behind,
         diverged,
+        production_branch,
     };
 
     Ok(status)
@@ -1517,6 +1545,10 @@ async fn build_work_list(repo_path: &str) -> WorkList {
     let remote_url = repo.as_ref().and_then(|r| {
         r.find_remote("origin").ok().and_then(|rm| rm.url().map(str::to_string))
     });
+    let production = repo
+        .as_ref()
+        .and_then(git_core::production_branch)
+        .unwrap_or_else(|| "master".to_string());
     if let Some(client) = provider_client_for(&remote_url).await {
         let waiting: Vec<(String, String)> = wip_item_log()
             .and_then(|l| l.actionable(repo_path).ok())
@@ -1525,7 +1557,7 @@ async fn build_work_list(repo_path: &str) -> WorkList {
             .filter(|i| i.status == "waiting")
             .filter_map(|i| {
                 let target = if classify_branch(&i.branch) == BranchClass::Hotfix {
-                    "master"
+                    production.as_str()
                 } else {
                     "develop"
                 };
@@ -1669,19 +1701,21 @@ pub struct InspectionOutcome {
 /// stash is re-applied so the tree is left exactly as it started. Never creates
 /// a branch, never resets, never discards.
 ///
-/// Pair with `end_branch_inspection`. Only `develop`/`master` are valid targets.
+/// Pair with `end_branch_inspection`. Only `develop` and the repo's production
+/// branch (`main`/`master`) are valid targets.
 #[tauri::command]
 pub async fn inspect_branch(
     app: AppHandle,
     repo_path: String,
     target: String,
 ) -> Result<InspectionOutcome, String> {
-    if target != "develop" && target != "master" {
+    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let production = resolve_production(&repo)?;
+    if target != "develop" && target != production {
         return Err(format!(
-            "branch inspection only supports 'develop' or 'master', not '{target}'"
+            "branch inspection only supports 'develop' or '{production}', not '{target}'"
         ));
     }
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
     let original_branch = current_branch(&repo)?;
     if original_branch == target {
         return Err(format!("already on '{target}' -- nothing to inspect"));
