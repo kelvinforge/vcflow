@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react"
 import { FolderOpen, RefreshCw } from "lucide-react"
-import { openWorkingDirectory, type RepoStatus } from "@/lib/tauri"
+import { openWorkingDirectory, pickRepo, type RepoStatus } from "@/lib/tauri"
 import { loadRecentRepos, rememberRepo } from "@/lib/repo"
-import { Badge, Button, Input } from "@/components/ui"
+import { Badge, Button } from "@/components/ui"
 import { TokenButton } from "@/components/TokenButton"
 
 function ago(ts: number | null): string {
@@ -29,7 +29,6 @@ export function RepoHeader({
   onRefresh: () => void
 }) {
   // Parent passes key={repoPath}, so this mounts fresh per repo -- no prop sync.
-  const [input, setInput] = useState(repoPath)
   const [recents, setRecents] = useState<string[]>(loadRecentRepos)
   const [, tick] = useState(0)
 
@@ -45,20 +44,30 @@ export function RepoHeader({
     onOpenRepo(t)
   }
 
+  const browse = async () => {
+    const picked = await pickRepo()
+    if (picked) open(picked)
+  }
+
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-border bg-card p-4">
       <p className="text-xs font-medium text-foreground">Repository</p>
 
       <div className="flex gap-2">
-        <Input
-          className="flex-1"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && open(input)}
-          placeholder="/path/to/repo"
-        />
-        <Button variant="primary" disabled={!input.trim()} onClick={() => open(input)}>
-          Open
+        <select
+          className="flex-1 rounded border border-border bg-transparent px-2 py-1 text-xs"
+          value=""
+          onChange={(e) => e.target.value && open(e.target.value)}
+        >
+          <option value="">{recents.length ? "Recent repositories…" : "No recent repositories"}</option>
+          {recents.map((r) => (
+            <option key={r} value={r}>
+              {r.split("/").filter(Boolean).pop() || r}
+            </option>
+          ))}
+        </select>
+        <Button variant="primary" onClick={browse}>
+          Open…
         </Button>
         <Button onClick={() => openWorkingDirectory(repoPath)} title="Open in file manager">
           <FolderOpen size={14} />
@@ -67,26 +76,8 @@ export function RepoHeader({
 
       {!status && (
         <p className="text-xs text-muted-foreground">
-          Enter a local repository path or choose a recent repository.
+          Choose a repository folder, or pick a recent one.
         </p>
-      )}
-
-      {recents.length > 0 && (
-        <label className="flex items-center gap-2 text-xs text-muted-foreground">
-          Recent repositories:
-          <select
-            className="flex-1 rounded border border-border bg-transparent px-2 py-1"
-            value=""
-            onChange={(e) => e.target.value && open(e.target.value)}
-          >
-            <option value="">Choose…</option>
-            {recents.map((r) => (
-              <option key={r} value={r}>
-                {r.split("/").filter(Boolean).pop() || r}
-              </option>
-            ))}
-          </select>
-        </label>
       )}
 
       {status && (
