@@ -1,0 +1,8 @@
+[package]
+name = "workflow_engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "2"
+git_core = { path = "../git_core" }

@@ -1,0 +1,21 @@
+mod audit;
+mod capability;
+mod command_log;
+mod config;
+mod credential_store;
+mod role;
+mod conflicts;
+mod saved_work;
+mod wip_items;
+mod work_items;
+
+pub use audit::{AuditEntry, AuditError, AuditLog};
+pub use command_log::{mask_secrets, record_op, CommandLog, CommandRecord};
+pub use capability::Capability;
+pub use config::{default_config_path, load as load_config, save as save_config, Config, ConfigError, OverrideRole, RoleOverride};
+pub use credential_store::{CredentialError, CredentialStore};
+pub use role::resolve_role;
+pub use conflicts::{ConflictLog, ConflictRecord};
+pub use saved_work::{SavedWorkLog, SavedWorkRecord};
+pub use wip_items::{WipItem, WipItemLog};
+pub use work_items::{WorkItemLog, WorkItemMr};

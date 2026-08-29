@@ -1,0 +1,17 @@
+# deps / build
+/node_modules/
+/dist/
+/src-tauri/target/
+
+# local
+.DS_Store
+.idea/
+
+# AI tooling scratch (keep CLAUDE.md / AGENTS.md, ignore local state)
+.claude/
+!.claude/agents/
+.cursor/
+.aider*
+.windsurfrules
+graphify-out/
+CLAUDE.local.md

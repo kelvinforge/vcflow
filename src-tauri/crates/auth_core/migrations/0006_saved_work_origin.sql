@@ -1,0 +1,12 @@
+-- Adds `original_commit`: the branch HEAD commit OID captured at the moment a
+-- Saved Work entry was created, so a resume can be reasoned about against a
+-- known base commit. Applied idempotently on every open (the ADD COLUMN is
+-- ignored once the column exists).
+--
+-- Extended `status` vocabulary carried by the existing column:
+--   'saved'     -- available to resume
+--   'conflict'  -- a resume collided; entry preserved, workdir has markers
+--   'restored'  -- re-applied and dropped
+--   'discarded' -- dropped without applying
+-- ('restoring' is a transient frontend-only state, never persisted here.)
+ALTER TABLE saved_work ADD COLUMN original_commit TEXT NOT NULL DEFAULT '';
