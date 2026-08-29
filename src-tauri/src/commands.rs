@@ -874,16 +874,17 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
     let branch = current_branch(&repo)?;
     let class = classify_branch(&branch);
 
-    let (dirty, in_progress_op, diverged) = match git_core::read_repository_state(&repo).ok() {
+    let (dirty, in_progress_op, ahead, diverged) = match git_core::read_repository_state(&repo).ok() {
         Some(s) => {
             let up = s.upstream.unwrap_or_default();
             (
                 s.working_tree.is_dirty(),
                 s.in_progress_op.map(|o| o.label().to_string()),
+                up.ahead,
                 up.is_diverged(),
             )
         }
-        None => (false, None, false),
+        None => (false, None, 0, false),
     };
 
     let role = resolve_workflow_role(&repo_path).await;
@@ -938,6 +939,7 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
         work_item,
         in_progress_op,
         dirty,
+        ahead,
         diverged,
         mr,
     });
@@ -950,6 +952,7 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
                 PrimaryAction::ResolveInWorkingDir => "resolve_in_working_dir",
                 PrimaryAction::ResolveMrConflict => "resolve_mr_conflict",
                 PrimaryAction::Commit => "commit",
+                PrimaryAction::Push => "push",
                 PrimaryAction::Finish => "finish",
                 PrimaryAction::FinishHotfix => "finish_hotfix",
                 PrimaryAction::ReturnToDevelop => "return_to_develop",

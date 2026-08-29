@@ -5,12 +5,13 @@
 // button say and which command does it call".
 
 import type { LucideIcon } from "lucide-react"
-import { GitCommitVertical, GitPullRequestArrow, Play, Rocket, TriangleAlert, Undo2 } from "lucide-react"
+import { GitCommitVertical, GitPullRequestArrow, Play, Rocket, TriangleAlert, Undo2, Upload } from "lucide-react"
 import {
   createWorkItem,
   finishHotfix,
   finishWorkItem,
   commitWorkItem,
+  pushWorkItem,
   type PrimaryActionId,
   type WorkItemKind,
 } from "@/lib/tauri"
@@ -41,6 +42,13 @@ export const ACTIONS: Record<PrimaryActionId, ActionDef> = {
     kind: "trigger",
     fields: ["message"],
     run: ({ repoPath, values }) => commitWorkItem(repoPath, values.message ?? ""),
+  },
+  push: {
+    label: "Push to update MR",
+    icon: Upload,
+    kind: "trigger",
+    fields: [],
+    run: ({ repoPath }) => pushWorkItem(repoPath),
   },
   finish: {
     label: "Finish (push + open MR)",

@@ -20,6 +20,11 @@ export function ExistingWorkflow({ wf }: { wf: WorkflowState }) {
   // next action, surface the Owner-only resolution panel open.
   const inConflict = wf.nextAction?.primary === "resolve_mr_conflict"
 
+  // "Your work" is the develop-branch launchpad: what to pick up after finishing
+  // a branch. Off develop you're mid-work (NextActionCard drives it); during
+  // inspection you're only parked on develop, not acting.
+  const onDevelop = wf.status?.branch === "develop" && !wf.inspection
+
   // Triggered-command wrapper: pause auto-refresh, run, resume + refresh.
   // Returns the raw backend error string, or null on success.
   const onRun = async (run: () => Promise<unknown>): Promise<string | null> => {
@@ -62,9 +67,11 @@ export function ExistingWorkflow({ wf }: { wf: WorkflowState }) {
         }
       />
 
-      <Section title="Your work" defaultOpen>
-        <WorkPanel repoPath={wf.repoPath} onChanged={wf.refreshNow} reloadSignal={wf.syncTick} />
-      </Section>
+      {onDevelop && (
+        <Section title="Your work" defaultOpen>
+          <WorkPanel repoPath={wf.repoPath} onChanged={wf.refreshNow} reloadSignal={wf.syncTick} />
+        </Section>
+      )}
 
       <Section title="Review Handoff" defaultOpen>
         <MrPanel mr={wf.mr} hotfix={wf.hotfix} />

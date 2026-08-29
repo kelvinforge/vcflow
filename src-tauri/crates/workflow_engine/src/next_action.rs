@@ -11,6 +11,8 @@ pub struct WorkflowSnapshot {
     /// Label of a half-finished git op (`merge`/`rebase`/...), if any.
     pub in_progress_op: Option<String>,
     pub dirty: bool,
+    /// Local commits on the current branch that `origin/<branch>` lacks.
+    pub ahead: usize,
     /// Current branch vs `origin/<branch>`: both sides carry unique commits.
     /// Work Safe: never auto-resolved.
     pub diverged: bool,
@@ -53,6 +55,8 @@ pub enum PrimaryAction {
     /// Owner-only: start conflict resolution for the MR.
     ResolveMrConflict,
     Commit,
+    /// Push the current branch to `origin` (follow-up commits onto an open MR).
+    Push,
     /// Push + open the work-item MR into `develop`, in one gated step.
     Finish,
     /// Push + open the hotfix MR into `master` (and the `master -> develop`
@@ -127,12 +131,35 @@ pub fn next_action(s: &WorkflowSnapshot) -> NextAction {
     }
 
     match s.work_item {
-        WorkItemState::PushedForReview => NextAction {
-            title: "Waiting for review".into(),
-            description: "Your merge request is open. Wait for review and pipeline to pass.".into(),
-            primary: None,
-            helper: None,
-        },
+        WorkItemState::PushedForReview => {
+            if s.dirty {
+                NextAction {
+                    title: "Commit your follow-up changes".into(),
+                    description: "You have new uncommitted work on this branch while the merge \
+                                  request is open. Commit it, then push to update the MR."
+                        .into(),
+                    primary: Some(PrimaryAction::Commit),
+                    helper: None,
+                }
+            } else if s.ahead > 0 {
+                NextAction {
+                    title: "Push your follow-up commits".into(),
+                    description: "You have local commits the open merge request doesn't have yet. \
+                                  Push the branch to update it."
+                        .into(),
+                    primary: Some(PrimaryAction::Push),
+                    helper: None,
+                }
+            } else {
+                NextAction {
+                    title: "Waiting for review".into(),
+                    description: "Your merge request is open. Wait for review and pipeline to pass."
+                        .into(),
+                    primary: None,
+                    helper: None,
+                }
+            }
+        }
         WorkItemState::Developing => {
             if s.dirty {
                 NextAction {
@@ -186,6 +213,7 @@ mod tests {
             work_item: WorkItemState::Developing,
             in_progress_op: None,
             dirty: false,
+            ahead: 0,
             diverged: false,
             mr: None,
         }
@@ -258,6 +286,27 @@ mod tests {
             ..base()
         };
         assert_eq!(next_action(&s).primary, None);
+    }
+
+    #[test]
+    fn pushed_for_review_dirty_commits_then_ahead_pushes() {
+        let mr = Some(MrSnapshot { merged: false, conflicted: false });
+
+        let dirty = WorkflowSnapshot {
+            work_item: WorkItemState::PushedForReview,
+            dirty: true,
+            mr,
+            ..base()
+        };
+        assert_eq!(next_action(&dirty).primary, Some(PrimaryAction::Commit));
+
+        let ahead = WorkflowSnapshot {
+            work_item: WorkItemState::PushedForReview,
+            ahead: 2,
+            mr,
+            ..base()
+        };
+        assert_eq!(next_action(&ahead).primary, Some(PrimaryAction::Push));
     }
 
     #[test]

@@ -51,6 +51,7 @@ export type PrimaryActionId =
   | "resolve_in_working_dir"
   | "resolve_mr_conflict"
   | "commit"
+  | "push"
   | "finish"
   | "finish_hotfix"
   | "return_to_develop"
