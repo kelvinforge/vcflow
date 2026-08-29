@@ -55,38 +55,20 @@ export function StartPanel({
   }
 
   return (
-    <div className="grid gap-3 sm:grid-cols-3">
-      <Card>
-        <div className="flex h-full flex-col gap-2">
-          <p className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
-            <GitBranchPlus size={15} /> New work
-          </p>
-          <p className="flex-1 text-xs text-muted-foreground">
-            Start a feature, bug, or chore. Branches off the latest <code>develop</code> and merges
-            back with an MR. Any uncommitted work is saved first.
-          </p>
-          <Button variant="primary" className="w-full" onClick={() => setMode("work")}>
-            New work
-          </Button>
-        </div>
-      </Card>
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+      <Button variant="primary" onClick={() => setMode("work")}>
+        <span className="inline-flex items-center gap-1.5">
+          <GitBranchPlus size={14} /> New work
+        </span>
+      </Button>
 
-      <Card>
-        <div className="flex h-full flex-col gap-2">
-          <p className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
-            <Siren size={15} /> Hotfix
-          </p>
-          <p className="flex-1 text-xs text-muted-foreground">
-            Urgent fix straight to production. Branches off <code>master</code>, auto-bumps the
-            patch version, and opens MRs to <code>master</code> and back to <code>develop</code>.
-          </p>
-          <Button variant="destructive" className="w-full" onClick={() => setMode("hotfix")}>
-            Hotfix
-          </Button>
-        </div>
-      </Card>
+      <Button variant="destructive" onClick={() => setMode("hotfix")}>
+        <span className="inline-flex items-center gap-1.5">
+          <Siren size={14} /> Hotfix
+        </span>
+      </Button>
 
-      {extra}
+      {extra && <div className="ml-auto">{extra}</div>}
     </div>
   )
 }
@@ -123,6 +105,10 @@ function WorkForm({
     <Card>
       <div className="flex flex-col gap-2">
         <p className="text-sm font-semibold text-foreground">New work item</p>
+        <p className="text-xs text-muted-foreground">
+          Start a feature, bug, or chore. Branches off the latest <code>develop</code> and merges
+          back with an MR. Any uncommitted work is saved first.
+        </p>
         <div className="flex gap-2">
           <select
             className="rounded border border-border bg-transparent px-2 py-1 text-sm"
@@ -198,6 +184,10 @@ function HotfixForm({
     <Card>
       <div className="flex flex-col gap-2">
         <p className="text-sm font-semibold text-foreground">New hotfix</p>
+        <p className="text-xs text-muted-foreground">
+          Urgent fix straight to production. Branches off <code>master</code>, auto-bumps the patch
+          version, and opens MRs to <code>master</code> and back to <code>develop</code>.
+        </p>
         {preview && (
           <p className="text-xs text-muted-foreground">
             Version bump: <span className="text-foreground">v{preview.current_version}</span> →{" "}

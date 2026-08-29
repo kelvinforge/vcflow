@@ -3,7 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window"
 import { useWorkflow } from "@/hooks/useWorkflow"
 import { useSetupGate } from "@/hooks/useSetupGate"
 import { loadLastRepo } from "@/lib/repo"
-import { RepoHeader } from "@/components/RepoHeader"
+import { RepoHeader, RepoHealth } from "@/components/RepoHeader"
 import { SetupCard } from "@/components/SetupCard"
 import { ExistingWorkflow } from "@/components/ExistingWorkflow"
 
@@ -22,22 +22,19 @@ function App() {
   }, [branch])
 
   return (
-    <main className="mx-auto flex min-h-svh w-full max-w-xl flex-col gap-4 p-6">
-      <h1 className="flex items-baseline gap-2 text-lg font-semibold text-foreground">
-        vcflow
-        <span className="text-xs font-normal text-muted-foreground">v{__APP_VERSION__}</span>
-      </h1>
-
-      <RepoHeader
-        key={wf.repoPath}
-        repoPath={wf.repoPath}
-        status={wf.status}
-        lastRefreshed={wf.lastRefreshed}
-        refreshing={wf.refreshing}
-        // Directory picker is blocked while Initial Workflow is running.
-        onOpenRepo={setup.initializing ? () => {} : wf.setRepoPath}
-        onRefresh={wf.refreshNow}
-      />
+    <main className="flex min-h-svh w-full flex-col gap-4 p-6 pt-0">
+      <header className="sticky top-0 z-10 -mx-6 flex flex-col gap-2 border-b border-border bg-background px-6 py-3">
+        <RepoHeader
+          key={wf.repoPath}
+          repoPath={wf.repoPath}
+          status={wf.status}
+          lastRefreshed={wf.lastRefreshed}
+          refreshing={wf.refreshing}
+          // Directory picker is blocked while Initial Workflow is running.
+          onOpenRepo={setup.initializing ? () => {} : wf.setRepoPath}
+          onRefresh={wf.refreshNow}
+        />
+      </header>
 
       {ready ? (
         <ExistingWorkflow wf={wf} />
@@ -57,6 +54,14 @@ function App() {
           }}
         />
       )}
+
+      <footer className="sticky bottom-0 -mx-6 mt-auto flex items-center justify-between border-t border-border bg-background px-6 py-2 text-xs text-muted-foreground">
+        <span className="flex items-baseline gap-1">
+          vcflow
+          <span>v{__APP_VERSION__}</span>
+        </span>
+        <RepoHealth status={wf.status} />
+      </footer>
     </main>
   )
 }
