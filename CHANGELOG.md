@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 — 2026-08-31
+
+### Features
+- feat(workflow-guard): severity styling + slugify branch names
+- feat: add Workflow Guard V1 for protected branches
+
 ## 0.1.0 — 2026-08-31
 
 ### New Features
