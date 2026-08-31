@@ -57,6 +57,12 @@ pub struct RepoStatus {
     /// exists yet. The frontend uses this for branch-inspection targets instead
     /// of assuming `master`.
     pub production_branch: String,
+
+    /// The current branch is protected (`main`/`master`/`develop`) -- the
+    /// Workflow Guard covers it. Purely a UI hint (the "Protected" badge); the
+    /// actual commit/push blocking is enforced in the command layer. Derived
+    /// from `classify_branch`, never a separate hard-coded list.
+    pub branch_protected: bool,
 }
 
 /// Resolve the repo's production branch (`main`/`master`), erroring when the
@@ -632,6 +638,129 @@ pub async fn create_work_item(
     build_and_emit_status(&app, &repo_path).await
 }
 
+/// Outcome of `move_changes_to_new_branch`: the fresh status on the new branch
+/// plus what happened to the changes carried over.
+#[derive(Debug, Clone, Serialize)]
+pub struct MoveChangesOutcome {
+    pub status: RepoStatus,
+    pub new_branch: String,
+    /// `"restored"` (re-applied cleanly), `"conflict"` (re-applied with
+    /// collisions -- markers in the working dir on the new branch, Saved Work
+    /// entry kept), or `"error"` (could not auto-apply -- entry untouched, use
+    /// Resume in the Saved work panel). Never `"none"`: the guard only runs on
+    /// a dirty tree.
+    pub restore_outcome: String,
+    pub conflicting_files: Vec<String>,
+}
+
+/// Re-apply the Saved Work row `id` onto the current (clean) branch. Mirrors
+/// the auto-restore in `continue_work`; never resets or discards. Returns
+/// `("restored" | "conflict" | "error", files)`.
+fn restore_saved_by_id(repo_path: &str, repo: &mut Repository, id: i64) -> (String, Vec<String>) {
+    let Some(log) = saved_work_log() else {
+        return ("error".to_string(), vec![]);
+    };
+    let Ok(Some(rec)) = log.get(id) else {
+        return ("error".to_string(), vec![]);
+    };
+    match run_git(repo_path, "restore_work", &rec.branch, || {
+        git_core::restore_work(repo, &rec.stash_oid)
+    }) {
+        Ok(()) => {
+            log.set_status(id, "restored").ok();
+            audit_best_effort(repo_path, "resume_work", &rec.branch, None);
+            ("restored".to_string(), vec![])
+        }
+        Err(git_core::SaveWorkError::Conflict { files }) => {
+            log.set_status(id, "conflict").ok();
+            audit_best_effort(repo_path, "resume_work_conflict", &rec.branch, None);
+            ("conflict".to_string(), files)
+        }
+        Err(_) => ("error".to_string(), vec![]),
+    }
+}
+
+/// Workflow Guard recovery: on a protected branch (`main`/`master`/`develop`)
+/// with a dirty tree, stash the changes (existing Save Work path), create
+/// `<kind>/<slug>` off `develop`, check it out, and re-apply the changes there.
+/// Reuses `guard_working_tree`, `create_work_branch` and the Saved Work restore
+/// -- no new stash/restore logic. Nothing is ever discarded.
+#[tauri::command]
+pub async fn move_changes_to_new_branch(
+    app: AppHandle,
+    repo_path: String,
+    kind: String,
+    slug: String,
+) -> Result<MoveChangesOutcome, String> {
+    let (new_branch, restore_outcome, conflicting_files) =
+        move_changes_to_new_branch_inner(&repo_path, &kind, &slug)?;
+    audit_best_effort(&repo_path, "move_changes_to_new_branch", &new_branch, None);
+    let status = build_and_emit_status(&app, &repo_path).await?;
+    Ok(MoveChangesOutcome { status, new_branch, restore_outcome, conflicting_files })
+}
+
+/// `AppHandle`-free core so it is directly testable. Returns
+/// `(new_branch, restore_outcome, conflicting_files)`.
+fn move_changes_to_new_branch_inner(
+    repo_path: &str,
+    kind: &str,
+    slug: &str,
+) -> Result<(String, String, Vec<String>), String> {
+    let branch_kind = parse_branch_kind(kind)?;
+    let mut repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
+
+    let current = current_branch(&repo)?;
+    if !branch_is_protected(&current) {
+        return Err(format!(
+            "Move Changes to New Branch only applies on a protected branch (main/master/develop), \
+             not '{current}'."
+        ));
+    }
+    if !git_core::read_repository_state(&repo)
+        .map_err(|e| e.to_string())?
+        .working_tree
+        .is_dirty()
+    {
+        return Err("Nothing to move -- the working tree is clean.".to_string());
+    }
+    // New work always bases on `develop`; require it before we stash anything.
+    repo.find_branch("develop", git2::BranchType::Local)
+        .map_err(|_| "No local 'develop' branch to base the new work on.".to_string())?;
+
+    // 1. Stash the dirty tree into Saved Work (recorded against `current`).
+    let saved_id = guard_working_tree(repo_path, &mut repo, &format!("moving changes off {current}"))?
+        .ok_or("working tree reported dirty but nothing was saved")?;
+
+    // 2. Bring `develop` current, then branch off it. Fetch + fast-forward are
+    //    best-effort and skipped when `develop` was never pushed; a real
+    //    divergence is still a hard STOP (Work Safe). The Saved Work entry
+    //    stays resumable if this fails.
+    let _ = git_core::fetch_origin(&repo);
+    if repo.revparse_single("refs/remotes/origin/develop").is_ok() {
+        run_git(repo_path, "fast_forward", "develop", || {
+            git_core::fast_forward_from_origin(&repo, "develop")
+        })
+        .map_err(|e| e.to_string())?;
+    }
+
+    let new_branch = run_git(
+        repo_path,
+        "create_branch",
+        &format!("{kind}/{slug} off develop"),
+        || git_core::create_work_branch(&repo, branch_kind, slug, "develop"),
+    )
+    .map_err(|e| e.to_string())?;
+
+    if let Some(log) = wip_item_log() {
+        log.start(repo_path, &new_branch, kind).ok();
+    }
+
+    // 3. Re-apply the saved changes onto the new branch.
+    let (restore_outcome, conflicting_files) = restore_saved_by_id(repo_path, &mut repo, saved_id);
+
+    Ok((new_branch, restore_outcome, conflicting_files))
+}
+
 /// Stages and commits everything currently in the working tree.
 #[tauri::command]
 pub async fn commit_work_item(
@@ -640,6 +769,7 @@ pub async fn commit_work_item(
     message: String,
 ) -> Result<RepoStatus, String> {
     let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    reject_protected_branch(&repo, "commit")?;
     run_git(&repo_path, "commit", &message, || git_core::commit_all(&repo, &message))
         .map_err(|e| e.to_string())?;
 
@@ -652,6 +782,7 @@ pub async fn commit_work_item(
 #[tauri::command]
 pub async fn push_work_item(app: AppHandle, repo_path: String) -> Result<RepoStatus, String> {
     let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    reject_protected_branch(&repo, "push")?;
     let branch = current_branch(&repo)?;
     run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch)).map_err(|e| e.to_string())?;
 
@@ -986,6 +1117,7 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
                 PrimaryAction::ReturnToDevelop => "return_to_develop",
                 PrimaryAction::UpdateBranch => "update_branch",
                 PrimaryAction::StartWorkItem => "start_work_item",
+                PrimaryAction::MoveToNewBranch => "move_to_new_branch",
             }
             .to_string()
         }),
@@ -1007,6 +1139,27 @@ fn classify_branch(name: &str) -> BranchClass {
         }
         _ => BranchClass::Other,
     }
+}
+
+/// A protected development branch the Workflow Guard covers -- no direct
+/// commits or pushes. Reuses `classify_branch`; never a separate branch list.
+fn branch_is_protected(name: &str) -> bool {
+    matches!(classify_branch(name), BranchClass::Develop | BranchClass::Master)
+}
+
+/// Workflow Guard enforcement: refuse a mutating git op on a protected branch.
+/// `op` is a verb like `"commit"` / `"push"`. Returns `Ok(())` on any normal
+/// working branch. This is the real block -- the Next Action card only explains.
+fn reject_protected_branch(repo: &Repository, op: &str) -> Result<(), String> {
+    let branch = current_branch(repo)?;
+    if branch_is_protected(&branch) {
+        return Err(format!(
+            "Workflow Guard: refusing to {op} on the protected branch '{branch}'. Direct \
+             development on protected branches is not allowed. Use \"Move Changes to New Branch\" \
+             in the Next Action card to move your changes onto a feature branch, then {op} there."
+        ));
+    }
+    Ok(())
 }
 
 async fn mr_snapshot(client: &ApiClient, mr_iid: &str) -> Option<MrSnapshot> {
@@ -1111,6 +1264,7 @@ async fn build_status(repo_path: &str) -> Result<RepoStatus, String> {
         None => (false, 0, None, 0, 0, false),
     };
 
+    let branch_protected = branch_is_protected(&info.current_branch);
     let status = RepoStatus {
         branch: info.current_branch,
         version: info.version,
@@ -1128,6 +1282,7 @@ async fn build_status(repo_path: &str) -> Result<RepoStatus, String> {
         behind,
         diverged,
         production_branch,
+        branch_protected,
     };
 
     Ok(status)
@@ -3068,6 +3223,142 @@ mod tests {
             n += 1;
         }
         assert_eq!(name, "release/1.4.0-2");
+    }
+
+    // --- Workflow Guard -------------------------------------------------
+
+    fn open_on(work: &Path, branch: &str) -> Repository {
+        git(work, &["checkout", branch]);
+        Repository::discover(work).unwrap()
+    }
+
+    #[test]
+    fn protected_branch_classification_matches_branch_class() {
+        assert!(branch_is_protected("main"));
+        assert!(branch_is_protected("master"));
+        assert!(branch_is_protected("develop"));
+        assert!(!branch_is_protected("feature/x"));
+        assert!(!branch_is_protected("bug/x"));
+        assert!(!branch_is_protected("hotfix/x"));
+        assert!(!branch_is_protected("release/1.0.0"));
+    }
+
+    #[test]
+    fn guard_blocks_commit_and_push_on_protected_branches() {
+        isolate_db();
+        let (_origin, work) = repo_with_origin();
+        git(work.path(), &["branch", "develop"]);
+
+        for b in ["main", "develop"] {
+            let repo = open_on(work.path(), b);
+            let commit_err = reject_protected_branch(&repo, "commit").unwrap_err();
+            assert!(commit_err.contains("Workflow Guard"), "{commit_err}");
+            assert!(commit_err.contains(b), "{commit_err}");
+            assert!(reject_protected_branch(&repo, "push").is_err());
+        }
+    }
+
+    #[test]
+    fn guard_allows_commit_and_push_on_feature_branch() {
+        isolate_db();
+        let (_origin, work) = repo_with_origin();
+        git(work.path(), &["checkout", "-b", "feature/thing"]);
+        let repo = Repository::discover(work.path()).unwrap();
+        assert!(reject_protected_branch(&repo, "commit").is_ok());
+        assert!(reject_protected_branch(&repo, "push").is_ok());
+    }
+
+    #[test]
+    fn move_changes_from_develop_creates_feature_branch_and_restores() {
+        isolate_db();
+        let (_origin, work) = repo_with_origin();
+        git(work.path(), &["branch", "develop"]);
+        git(work.path(), &["checkout", "develop"]);
+        std::fs::write(work.path().join("a.txt"), "work in progress\n").unwrap();
+        std::fs::write(work.path().join("new.txt"), "brand new\n").unwrap();
+        let rp = work.path().to_str().unwrap();
+
+        let (branch, outcome, conflicts) =
+            move_changes_to_new_branch_inner(rp, "feature", "rescued").unwrap();
+
+        assert_eq!(branch, "feature/rescued");
+        assert_eq!(outcome, "restored");
+        assert!(conflicts.is_empty());
+        assert_eq!(git_out(work.path(), &["rev-parse", "--abbrev-ref", "HEAD"]), "feature/rescued");
+        assert_eq!(std::fs::read_to_string(work.path().join("a.txt")).unwrap(), "work in progress\n");
+        assert_eq!(std::fs::read_to_string(work.path().join("new.txt")).unwrap(), "brand new\n");
+        // develop's committed tree is untouched (a.txt still the seed content).
+        assert_eq!(git_out(work.path(), &["show", "develop:a.txt"]), "a");
+    }
+
+    #[test]
+    fn move_changes_from_production_bases_on_develop_and_restores() {
+        isolate_db();
+        let (_origin, work) = repo_with_origin();
+        git(work.path(), &["branch", "develop"]);
+        // stay on main (production)
+        std::fs::write(work.path().join("a.txt"), "hotfix-ish edit\n").unwrap();
+        let rp = work.path().to_str().unwrap();
+
+        let (branch, outcome, _) = move_changes_to_new_branch_inner(rp, "bug", "oops").unwrap();
+
+        assert_eq!(branch, "bug/oops");
+        assert_eq!(outcome, "restored");
+        // new branch descends from develop, not main
+        let base = git_out(work.path(), &["merge-base", "HEAD", "develop"]);
+        let dev = git_out(work.path(), &["rev-parse", "develop"]);
+        assert_eq!(base, dev);
+        assert_eq!(std::fs::read_to_string(work.path().join("a.txt")).unwrap(), "hotfix-ish edit\n");
+        assert_eq!(git_out(work.path(), &["rev-parse", "--abbrev-ref", "main"]), "main");
+    }
+
+    #[test]
+    fn move_changes_surfaces_restore_conflict_without_discarding() {
+        isolate_db();
+        let (_origin, work) = repo_with_origin();
+        // develop diverges from main on the same file the user is editing.
+        git(work.path(), &["checkout", "-b", "develop"]);
+        std::fs::write(work.path().join("a.txt"), "develop version\n").unwrap();
+        git(work.path(), &["commit", "-am", "develop edits a"]);
+        git(work.path(), &["checkout", "main"]);
+        std::fs::write(work.path().join("a.txt"), "my uncommitted edit\n").unwrap();
+        let rp = work.path().to_str().unwrap();
+
+        let (branch, outcome, conflicts) =
+            move_changes_to_new_branch_inner(rp, "feature", "collide").unwrap();
+
+        assert_eq!(branch, "feature/collide");
+        assert_eq!(outcome, "conflict");
+        assert!(conflicts.iter().any(|f| f == "a.txt"), "{conflicts:?}");
+        // The Saved Work entry is kept for recovery -- nothing discarded.
+        let kept = saved_work_log()
+            .unwrap()
+            .actionable_entries(rp)
+            .unwrap()
+            .into_iter()
+            .any(|r| r.status == "conflict");
+        assert!(kept, "conflicted Saved Work entry must be kept");
+    }
+
+    #[test]
+    fn move_changes_refuses_on_clean_protected_branch() {
+        isolate_db();
+        let (_origin, work) = repo_with_origin();
+        git(work.path(), &["branch", "develop"]);
+        let rp = work.path().to_str().unwrap();
+        let err = move_changes_to_new_branch_inner(rp, "feature", "nope").unwrap_err();
+        assert!(err.contains("clean"), "{err}");
+    }
+
+    #[test]
+    fn move_changes_refuses_on_feature_branch() {
+        isolate_db();
+        let (_origin, work) = repo_with_origin();
+        git(work.path(), &["checkout", "-b", "feature/already"]);
+        std::fs::write(work.path().join("a.txt"), "x\n").unwrap();
+        let rp = work.path().to_str().unwrap();
+        let err = move_changes_to_new_branch_inner(rp, "feature", "nope").unwrap_err();
+        assert!(err.contains("only applies on a protected branch"), "{err}");
     }
 
     #[test]

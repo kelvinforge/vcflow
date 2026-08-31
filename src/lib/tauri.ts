@@ -29,6 +29,9 @@ export interface RepoStatus {
   diverged: boolean
   /** The repo's production branch: "main" or "master", whichever exists. */
   production_branch: string
+  /** Current branch is protected (main/master/develop) — Workflow Guard covers
+   *  it. UI hint only; enforcement is in the command layer. */
+  branch_protected: boolean
 }
 
 export interface RepoStatusWithPath {
@@ -59,6 +62,7 @@ export type PrimaryActionId =
   | "return_to_develop"
   | "update_branch"
   | "start_work_item"
+  | "move_to_new_branch"
 
 export interface NextActionDto {
   title: string
@@ -82,6 +86,24 @@ export function createWorkItem(
   slug: string,
 ): Promise<RepoStatus> {
   return invoke<RepoStatus>("create_work_item", { repoPath, kind, slug })
+}
+
+export interface MoveChangesOutcome {
+  status: RepoStatus
+  new_branch: string
+  /** "restored" | "conflict" | "error" — what happened to the carried-over changes. */
+  restore_outcome: "restored" | "conflict" | "error"
+  conflicting_files: string[]
+}
+
+/** Workflow Guard recovery: stash changes on a protected branch, create
+ *  `<kind>/<slug>` off develop, and re-apply the changes there. */
+export function moveChangesToNewBranch(
+  repoPath: string,
+  kind: WorkItemKind,
+  slug: string,
+): Promise<MoveChangesOutcome> {
+  return invoke<MoveChangesOutcome>("move_changes_to_new_branch", { repoPath, kind, slug })
 }
 
 export function commitWorkItem(repoPath: string, message: string): Promise<RepoStatus> {

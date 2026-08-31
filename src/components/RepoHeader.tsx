@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react"
 import { FolderOpen, RefreshCw } from "lucide-react"
 import { pickRepo, type RepoStatus } from "@/lib/tauri"
 import { loadRecentRepos, rememberRepo } from "@/lib/repo"
-import { Button } from "@/components/ui"
+import { Badge, Button } from "@/components/ui"
 import { TokenButton } from "@/components/TokenButton"
 import { cn } from "@/lib/utils"
 
@@ -117,6 +117,11 @@ export function RepoHeader({
             <span>{status.provider}</span>
             <Dot>·</Dot>
             <span className="font-medium text-foreground">{status.branch}</span>
+            {status.branch_protected && (
+              <Badge tone="warn" title="Protected branch — commits and pushes are blocked by the Workflow Guard">
+                Protected
+              </Badge>
+            )}
             {status.version && (
               <>
                 <Dot>·</Dot>

@@ -18,15 +18,20 @@ function MrRow({ label, mr }: { label: string; mr: MrStatus | null }) {
       </div>
     )
   }
-  const conflicted = mr.mergeability === "Conflicted"
+  // Mergeability only has meaning while the MR is open -- a merged/closed MR
+  // reports "Unknown" from the provider. Show that badge for open MRs only.
+  const open = mr.status === "Open"
+  const conflicted = open && mr.mergeability === "Conflicted"
   return (
     <div className="flex items-center justify-between gap-2 text-xs">
       <span className="text-muted-foreground">{label}</span>
       <span className="flex items-center gap-2">
         <Badge tone={conflicted ? "bad" : "muted"}>{mr.status}</Badge>
-        <Badge tone={conflicted ? "bad" : "ok"}>
-          {conflicted ? "conflict (Owner resolves)" : mr.mergeability}
-        </Badge>
+        {open && (
+          <Badge tone={conflicted ? "bad" : "ok"}>
+            {conflicted ? "conflict (Owner resolves)" : mr.mergeability}
+          </Badge>
+        )}
         <button
           className="text-muted-foreground hover:text-foreground"
           onClick={() => openUrl(mr.web_url)}
@@ -120,7 +125,7 @@ function ReleaseRows({
 
       <div className="border-t border-border pt-2">
         {release.complete ? (
-          <Badge tone="ok">✓ Release complete — production shipped, develop synced</Badge>
+          <Badge tone="ok">✓ Release v{release.version} shipped — production live, develop synced</Badge>
         ) : release.sync_required ? (
           <div className="flex flex-col gap-1">
             <Badge tone="warn">Production merged — develop sync owed</Badge>
