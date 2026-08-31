@@ -64,6 +64,7 @@ export function ExistingWorkflow({ wf }: { wf: WorkflowState }) {
           wf.status.behind === 0 &&
           !wf.status.diverged
         }
+        developIdle={idle}
         onChanged={wf.refreshNow}
         extra={
           <BranchInspector
