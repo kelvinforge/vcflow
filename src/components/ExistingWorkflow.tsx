@@ -27,7 +27,11 @@ export function ExistingWorkflow({ wf }: { wf: WorkflowState }) {
   // by mistake, or wanting to browse other branches mid-task. Reset whenever
   // the branch or the next step changes, so it re-follows the default.
   const canPickWork = !wf.inspection
-  const idle = wf.status?.branch === "develop" || wf.nextAction?.primary == null
+  // "Idle" = nothing actionable, or the only action is starting fresh work
+  // (which has its own always-visible entry point). A real step on develop --
+  // e.g. update_branch when it's behind origin -- is not idle.
+  const idle =
+    wf.nextAction?.primary == null || wf.nextAction.primary === "start_work_item"
   const [pickOverride, setPickOverride] = useState<boolean | null>(null)
   useEffect(() => setPickOverride(null), [wf.status?.branch, wf.nextAction?.primary])
   const showWork = canPickWork && (pickOverride ?? idle)

@@ -897,18 +897,20 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
     let branch = current_branch(&repo)?;
     let class = classify_branch(&branch);
 
-    let (dirty, in_progress_op, ahead, diverged) = match git_core::read_repository_state(&repo).ok() {
-        Some(s) => {
-            let up = s.upstream.unwrap_or_default();
-            (
-                s.working_tree.is_dirty(),
-                s.in_progress_op.map(|o| o.label().to_string()),
-                up.ahead,
-                up.is_diverged(),
-            )
-        }
-        None => (false, None, 0, false),
-    };
+    let (dirty, in_progress_op, ahead, behind, diverged) =
+        match git_core::read_repository_state(&repo).ok() {
+            Some(s) => {
+                let up = s.upstream.unwrap_or_default();
+                (
+                    s.working_tree.is_dirty(),
+                    s.in_progress_op.map(|o| o.label().to_string()),
+                    up.ahead,
+                    up.behind,
+                    up.is_diverged(),
+                )
+            }
+            None => (false, None, 0, 0, false),
+        };
 
     let role = resolve_workflow_role(&repo_path).await;
 
@@ -963,6 +965,7 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
         in_progress_op,
         dirty,
         ahead,
+        behind,
         diverged,
         mr,
     });
@@ -981,6 +984,7 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
                 PrimaryAction::FinishRelease => "finish_release",
                 PrimaryAction::SyncDevelop => "sync_develop",
                 PrimaryAction::ReturnToDevelop => "return_to_develop",
+                PrimaryAction::UpdateBranch => "update_branch",
                 PrimaryAction::StartWorkItem => "start_work_item",
             }
             .to_string()
@@ -2756,6 +2760,35 @@ pub async fn get_release_status(repo_path: String) -> Result<Option<ReleaseStatu
         complete,
         superseded,
     }))
+}
+
+/// Fast-forward `develop` or the production branch to `origin/<branch>`.
+/// Refuses on any other branch, a dirty tree, or a real divergence -- it is a
+/// plain pull that never touches uncommitted work (Work Safe). Surfaced as the
+/// next action whenever HEAD sits on a stale develop/production.
+#[tauri::command]
+pub async fn update_branch(app: AppHandle, repo_path: String) -> Result<RepoStatus, String> {
+    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let branch = current_branch(&repo)?;
+    let production = resolve_production(&repo).ok();
+    if branch != "develop" && production.as_deref() != Some(branch.as_str()) {
+        return Err("update is only for develop or the production branch".into());
+    }
+    if git_core::read_repository_state(&repo)
+        .map_err(|e| e.to_string())?
+        .working_tree
+        .is_dirty()
+    {
+        return Err("commit or save your work first -- update does a plain fast-forward".into());
+    }
+
+    let _ = git_core::fetch_origin(&repo);
+    run_git(&repo_path, "fast_forward", &branch, || {
+        git_core::fast_forward_from_origin(&repo, &branch)
+    })
+    .map_err(|e| e.to_string())?;
+    audit_best_effort(&repo_path, "update_branch", &branch, None);
+    build_and_emit_status(&app, &repo_path).await
 }
 
 /// UI integration (not workflow logic): open the repo's working directory in

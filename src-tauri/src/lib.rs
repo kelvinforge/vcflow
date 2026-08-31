@@ -56,6 +56,7 @@ pub fn run() {
       commands::finish_release,
       commands::sync_develop_after_release,
       commands::get_release_status,
+      commands::update_branch,
       commands::open_working_directory,
       commands::open_url
     ])

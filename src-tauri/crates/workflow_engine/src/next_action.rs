@@ -13,6 +13,9 @@ pub struct WorkflowSnapshot {
     pub dirty: bool,
     /// Local commits on the current branch that `origin/<branch>` lacks.
     pub ahead: usize,
+    /// Commits on `origin/<branch>` the local branch lacks -- a plain
+    /// fast-forward pull catches up (only actioned for develop/production).
+    pub behind: usize,
     /// Current branch vs `origin/<branch>`: both sides carry unique commits.
     /// Work Safe: never auto-resolved.
     pub diverged: bool,
@@ -75,6 +78,10 @@ pub enum PrimaryAction {
     /// panel drives it; the variant exists so the command layer has one id.
     SyncDevelop,
     ReturnToDevelop,
+    /// Fast-forward the current branch to `origin/<branch>`. Only offered on
+    /// develop / production when it is behind, clean, and not diverged -- a
+    /// pure pull that never touches uncommitted work.
+    UpdateBranch,
     StartWorkItem,
 }
 
@@ -139,6 +146,26 @@ pub fn next_action(s: &WorkflowSnapshot) -> NextAction {
                 helper: None,
             };
         }
+    }
+
+    // Keep develop / production current: if HEAD is one of them, behind origin,
+    // clean and not diverged, a fast-forward pull is the next step -- before
+    // starting any work off a stale base.
+    if matches!(s.branch, BranchClass::Develop | BranchClass::Master)
+        && s.behind > 0
+        && !s.dirty
+    {
+        let name = if s.branch == BranchClass::Develop { "develop" } else { "the production branch" };
+        return NextAction {
+            title: format!("Update {name}"),
+            description: format!(
+                "{name} is {} commit(s) behind origin. Fast-forward it so new work starts from \
+                 the current base.",
+                s.behind
+            ),
+            primary: Some(PrimaryAction::UpdateBranch),
+            helper: None,
+        };
     }
 
     // A release-preparation branch has only three states here: a half-done op
@@ -254,6 +281,7 @@ mod tests {
             in_progress_op: None,
             dirty: false,
             ahead: 0,
+            behind: 0,
             diverged: false,
             mr: None,
         }
@@ -306,6 +334,29 @@ mod tests {
 
         let clean = WorkflowSnapshot { branch: BranchClass::Hotfix, ..base() };
         assert_eq!(next_action(&clean).primary, Some(PrimaryAction::FinishHotfix));
+    }
+
+    #[test]
+    fn develop_behind_offers_fast_forward_pull() {
+        let s = WorkflowSnapshot {
+            branch: BranchClass::Develop,
+            work_item: WorkItemState::NotStarted,
+            behind: 3,
+            ..base()
+        };
+        assert_eq!(next_action(&s).primary, Some(PrimaryAction::UpdateBranch));
+
+        // Dirty -> no auto pull; in sync -> not offered.
+        let dirty = WorkflowSnapshot { dirty: true, ..s.clone() };
+        assert_ne!(next_action(&dirty).primary, Some(PrimaryAction::UpdateBranch));
+        let synced = WorkflowSnapshot { behind: 0, ..s };
+        assert_eq!(next_action(&synced).primary, Some(PrimaryAction::StartWorkItem));
+    }
+
+    #[test]
+    fn work_branch_behind_is_not_auto_pulled() {
+        let s = WorkflowSnapshot { branch: BranchClass::WorkItem, behind: 2, ..base() };
+        assert_ne!(next_action(&s).primary, Some(PrimaryAction::UpdateBranch));
     }
 
     #[test]
