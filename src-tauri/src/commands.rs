@@ -2543,6 +2543,11 @@ pub struct ReleasePreview {
     /// Markdown lines to prefill the CHANGELOG textarea.
     pub changelog_seed: Vec<String>,
     pub pending_candidates: Vec<PendingCandidate>,
+    /// Count of commits on `origin/<production>` that `origin/develop` lacks
+    /// (`rev-list origin/<production> --not origin/develop`, merges excluded).
+    /// Non-zero => production is ahead; sync production -> develop before a new
+    /// release. The frontend gates the [Prepare Release] button on this.
+    pub production_commits_not_in_develop: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2617,6 +2622,14 @@ pub async fn get_release_preview(repo_path: String) -> Result<ReleasePreview, St
     let (prod_ref, dev_ref) = release_range_refs(&repo, &production);
     let commits =
         git_core::commits_to_release(&repo, &prod_ref, &dev_ref).map_err(|e| e.to_string())?;
+    // Reverse range: commits on production that develop lacks. Non-zero means
+    // production is ahead (hotfix / un-synced release) and develop must sync
+    // before a new release is prepared. ponytail: reuse commits_to_release with
+    // swapped refs rather than a new git helper.
+    let production_commits_not_in_develop =
+        git_core::commits_to_release(&repo, &dev_ref, &prod_ref)
+            .map_err(|e| e.to_string())?
+            .len();
     let bump = git_core::conventional_bump(&commits);
     let suggested = git_core::suggest_version(&current, bump);
 
@@ -2654,6 +2667,7 @@ pub async fn get_release_preview(repo_path: String) -> Result<ReleasePreview, St
         suggested_version: suggested.to_string(),
         changelog_seed: git_core::changelog_seed(&commits),
         pending_candidates: pending,
+        production_commits_not_in_develop,
     })
 }
 

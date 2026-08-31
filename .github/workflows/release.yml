@@ -52,6 +52,12 @@ jobs:
 
       - run: npm ci
 
+      # openssl-sys (via git2 -> libgit2-sys) needs to locate OpenSSL headers.
+      # Homebrew ships openssl@3 on the macOS runners; point the build at it.
+      - name: Configure OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

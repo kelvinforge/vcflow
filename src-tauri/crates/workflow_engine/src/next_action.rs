@@ -168,6 +168,31 @@ pub fn next_action(s: &WorkflowSnapshot) -> NextAction {
 
     if let Some(mr) = s.mr {
         if mr.merged {
+            // The branch still exists and carries new work: let them land it as
+            // a follow-up. `finish` opens a fresh MR (the tracked MR pointer is
+            // overwritten), so this is a normal commit -> finish cycle again.
+            if s.dirty {
+                return NextAction {
+                    title: "Commit your follow-up changes".into(),
+                    description: "This branch's merge request is already merged, but there is new \
+                                  uncommitted work here. Commit it, then finish to open a new \
+                                  merge request into develop."
+                        .into(),
+                    primary: Some(PrimaryAction::Commit),
+                    helper: None,
+                };
+            }
+            if s.ahead > 0 {
+                return NextAction {
+                    title: "Finish the follow-up work".into(),
+                    description: "This branch's merge request is already merged, but there are new \
+                                  local commits. Push the branch and open a new merge request into \
+                                  develop."
+                        .into(),
+                    primary: Some(PrimaryAction::Finish),
+                    helper: None,
+                };
+            }
             return NextAction {
                 title: "Merged".into(),
                 description: "Your merge request is merged. Return to develop to start the next \
@@ -472,6 +497,26 @@ mod tests {
             ..base()
         };
         assert_eq!(next_action(&s).primary, Some(PrimaryAction::ReturnToDevelop));
+    }
+
+    #[test]
+    fn merged_mr_with_new_work_offers_followup() {
+        let merged = MrSnapshot { merged: true, conflicted: false };
+        let dirty = WorkflowSnapshot {
+            work_item: WorkItemState::PushedForReview,
+            mr: Some(merged),
+            dirty: true,
+            ..base()
+        };
+        assert_eq!(next_action(&dirty).primary, Some(PrimaryAction::Commit));
+
+        let ahead = WorkflowSnapshot {
+            work_item: WorkItemState::PushedForReview,
+            mr: Some(merged),
+            ahead: 2,
+            ..base()
+        };
+        assert_eq!(next_action(&ahead).primary, Some(PrimaryAction::Finish));
     }
 
     #[test]

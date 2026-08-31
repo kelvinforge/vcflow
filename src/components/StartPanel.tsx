@@ -42,17 +42,51 @@ function BusyNote({ steps }: { steps: string }) {
 export function StartPanel({
   repoPath,
   currentBranch,
+  developInSync = false,
+  developIdle = false,
   onChanged,
   extra,
 }: {
   repoPath: string
-  /** Used only to gate [Prepare Release] to `develop`. */
+  /** Used to gate [Prepare Release] to `develop`. */
   currentBranch?: string | null
+  /** develop has no ahead/behind/divergence vs origin/develop. */
+  developInSync?: boolean
+  /** No pending workflow action on develop (e.g. not "Update develop"). */
+  developIdle?: boolean
   onChanged: () => void
   /** Extra card rendered alongside the entry-point cards (e.g. branch inspector). */
   extra?: ReactNode
 }) {
   const [mode, setMode] = useState<Mode>("choose")
+
+  // [Prepare Release] shows only when develop is the current branch, is synced
+  // with origin, carries commits production lacks, and production is not itself
+  // ahead (which would need a production -> develop sync first). Read-only,
+  // non-owner-gated preview; refetched whenever the gate inputs change.
+  const [releaseGate, setReleaseGate] = useState<ReleasePreview | null>(null)
+  const onDevelop = currentBranch === "develop"
+  useEffect(() => {
+    if (!onDevelop || !developInSync || !developIdle) {
+      setReleaseGate(null)
+      return
+    }
+    let live = true
+    getReleasePreview(repoPath)
+      .then((p) => live && setReleaseGate(p))
+      .catch(() => live && setReleaseGate(null))
+    return () => {
+      live = false
+    }
+  }, [repoPath, onDevelop, developInSync, developIdle])
+
+  const canPrepareRelease =
+    onDevelop &&
+    developInSync &&
+    developIdle &&
+    releaseGate != null &&
+    releaseGate.commit_count > 0 &&
+    releaseGate.production_commits_not_in_develop === 0
 
   if (mode === "work") {
     return <WorkForm repoPath={repoPath} onChanged={onChanged} onBack={() => setMode("choose")} />
@@ -78,7 +112,7 @@ export function StartPanel({
         </span>
       </Button>
 
-      {currentBranch === "develop" && (
+      {canPrepareRelease && (
         <Button onClick={() => setMode("release")}>
           <span className="inline-flex items-center gap-1.5">
             <Rocket size={14} /> Prepare Release
