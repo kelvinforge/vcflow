@@ -60,8 +60,10 @@ jobs:
           OPENSSL_PREFIX=$(brew --prefix openssl@3)
           echo "OPENSSL_DIR=$OPENSSL_PREFIX" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$OPENSSL_PREFIX/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
-          echo "LDFLAGS=-L$OPENSSL_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "LDFLAGS=-L$OPENSSL_PREFIX/lib -Wl,-undefined,dynamic_lookup" >> "$GITHUB_ENV"
           echo "CPPFLAGS=-I$OPENSSL_PREFIX/include" >> "$GITHUB_ENV"
+          echo "OPENSSL_LIB_DIR=$OPENSSL_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> "$GITHUB_ENV"
 
       - uses: tauri-apps/tauri-action@v0
         env:
