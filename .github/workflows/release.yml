@@ -1,22 +1,37 @@
 name: Release
 
+# VC Flow owns versioning: it creates the release branch, bumps VERSION,
+# updates CHANGELOG, merges to production/master and pushes the `vX.Y.Z` tag.
+# This workflow never bumps a version and never creates a tag.
+#
+#   - push tag `v*`        -> build Tauri, create the matching GitHub Release,
+#                             upload the bundles as Release assets
+#   - workflow_dispatch    -> build only, upload bundles as Actions artifacts,
+#                             no Release, no tag
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  publish-tauri:
+  build:
     permissions:
-      contents: write
+      contents: write # needed to create the GitHub Release on tag push
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
             args: '--target universal-apple-darwin'
+            rust_targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
           - os: windows-latest
             args: ''
+            rust_targets: ''
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -29,7 +44,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.rust_targets }}
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -41,9 +56,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: ${{ github.ref_name }}
+          # tag push -> publish a GitHub Release named after the tag.
+          # manual run -> tagName empty, so tauri-action only builds.
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseBody: 'See the assets to download this version.'
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Upload bundles as Actions artifacts (manual runs only)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ runner.os }}
+          path: src-tauri/target/**/release/bundle/
+          if-no-files-found: error
