@@ -1,15 +1,18 @@
 import { useEffect, useState, type ReactNode } from "react"
-import { GitBranchPlus, Siren } from "lucide-react"
+import { GitBranchPlus, Rocket, Siren } from "lucide-react"
 import {
   createHotfix,
+  createReleaseCandidate,
   createWorkItem,
   getHotfixVersionPreview,
+  getReleasePreview,
+  type ReleasePreview,
   type VersionPreview,
   type WorkItemKind,
 } from "@/lib/tauri"
-import { Button, Card, ErrorLine, Input } from "@/components/ui"
+import { Button, Card, ErrorLine, Input, Textarea } from "@/components/ui"
 
-type Mode = "choose" | "work" | "hotfix"
+type Mode = "choose" | "work" | "hotfix" | "release"
 
 /**
  * Live "still working" note. The create commands are one blocking backend call
@@ -37,10 +40,13 @@ function BusyNote({ steps }: { steps: string }) {
  */
 export function StartPanel({
   repoPath,
+  currentBranch,
   onChanged,
   extra,
 }: {
   repoPath: string
+  /** Used only to gate [Prepare Release] to `develop`. */
+  currentBranch?: string | null
   onChanged: () => void
   /** Extra card rendered alongside the entry-point cards (e.g. branch inspector). */
   extra?: ReactNode
@@ -52,6 +58,9 @@ export function StartPanel({
   }
   if (mode === "hotfix") {
     return <HotfixForm repoPath={repoPath} onChanged={onChanged} onBack={() => setMode("choose")} />
+  }
+  if (mode === "release") {
+    return <ReleaseForm repoPath={repoPath} onChanged={onChanged} onBack={() => setMode("choose")} />
   }
 
   return (
@@ -67,6 +76,14 @@ export function StartPanel({
           <Siren size={14} /> Hotfix
         </span>
       </Button>
+
+      {currentBranch === "develop" && (
+        <Button onClick={() => setMode("release")}>
+          <span className="inline-flex items-center gap-1.5">
+            <Rocket size={14} /> Prepare Release
+          </span>
+        </Button>
+      )}
 
       {extra && <div className="ml-auto">{extra}</div>}
     </div>
@@ -214,6 +231,147 @@ function HotfixForm({
         </div>
         {busy && <BusyNote steps="fetching master, bumping the version, creating the branch, opening MRs" />}
         {error && <ErrorLine error={error} onRetry={create} />}
+      </div>
+    </Card>
+  )
+}
+
+function ReleaseForm({
+  repoPath,
+  onChanged,
+  onBack,
+}: {
+  repoPath: string
+  onChanged: () => void
+  onBack: () => void
+}) {
+  const [preview, setPreview] = useState<ReleasePreview | null>(null)
+  const [version, setVersion] = useState("")
+  const [changelog, setChangelog] = useState("")
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  // Set once the backend asks to confirm supersede; the next submit passes true.
+  const [supersedePrompt, setSupersedePrompt] = useState<string | null>(null)
+
+  useEffect(() => {
+    getReleasePreview(repoPath)
+      .then((p) => {
+        setPreview(p)
+        setVersion(p.suggested_version)
+        setChangelog(p.changelog_seed.join("\n"))
+      })
+      .catch((e) => setError(String(e)))
+  }, [repoPath])
+
+  const submit = async (supersedeConfirmed: boolean) => {
+    setBusy(true)
+    setError(null)
+    try {
+      await createReleaseCandidate(repoPath, version.trim(), changelog, supersedeConfirmed)
+      onChanged()
+      onBack()
+    } catch (e) {
+      const msg = String(e)
+      if (msg.includes("SUPERSEDE_REQUIRED")) {
+        setSupersedePrompt(msg.replace(/^.*SUPERSEDE_REQUIRED:\s*/, ""))
+      } else {
+        setError(msg)
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const pending = preview?.pending_candidates ?? []
+
+  return (
+    <Card>
+      <div className="flex flex-col gap-2">
+        <p className="text-sm font-semibold text-foreground">Prepare release candidate</p>
+        <p className="text-xs text-muted-foreground">
+          Snapshots <code>develop</code> onto a short-lived <code>release/x.y.z</code> branch with
+          only <code>VERSION</code> + <code>CHANGELOG.md</code>. Review the diff, then Submit opens
+          the MR to production. It does not block develop.
+        </p>
+
+        {preview && (
+          <div className="text-xs text-muted-foreground">
+            <p>
+              Current production: <span className="text-foreground">v{preview.current_version}</span>
+            </p>
+            <p>
+              Commits to release: <span className="text-foreground">{preview.commit_count}</span> ·
+              impact <span className="text-foreground">{preview.impact}</span>
+            </p>
+          </div>
+        )}
+
+        {pending.length > 0 && (
+          <p className="text-xs text-amber-600 dark:text-amber-500">
+            ⚠ {pending.length} candidate(s) already in flight:{" "}
+            {pending.map((c) => `${c.branch}${c.merged ? " (merged!)" : ""}`).join(", ")}
+          </p>
+        )}
+
+        <label className="text-xs text-muted-foreground">
+          Version (SemVer, must exceed current)
+          <Input
+            className="mt-1"
+            value={version}
+            onChange={(e) => setVersion(e.target.value)}
+            placeholder="1.4.0"
+          />
+        </label>
+
+        <label className="text-xs text-muted-foreground">
+          CHANGELOG section
+          <Textarea
+            className="mt-1"
+            rows={8}
+            value={changelog}
+            onChange={(e) => setChangelog(e.target.value)}
+          />
+        </label>
+
+        {supersedePrompt ? (
+          <div className="flex flex-col gap-2 rounded border border-amber-500/40 bg-amber-500/5 p-2">
+            <p className="text-xs text-foreground">{supersedePrompt}</p>
+            <div className="flex gap-2">
+              <Button variant="destructive" disabled={busy} onClick={() => submit(true)}>
+                {busy ? "Working…" : "Supersede & prepare"}
+              </Button>
+              <Button disabled={busy} onClick={() => setSupersedePrompt(null)}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex gap-2">
+            <Button
+              variant="primary"
+              disabled={busy || !version.trim() || !preview}
+              onClick={() => submit(false)}
+            >
+              {busy ? "Working…" : "Prepare release candidate"}
+            </Button>
+            <Button disabled={busy} onClick={onBack}>
+              Cancel
+            </Button>
+          </div>
+        )}
+
+        {busy && <BusyNote steps="fetching develop, creating the release branch, writing VERSION + CHANGELOG" />}
+        {error && (
+          <>
+            <ErrorLine error={error} />
+            {error.includes("SYNC_REQUIRED") && (
+              <p className="text-xs text-muted-foreground">
+                A prior candidate already merged to production. Use “Sync Develop” in the Active
+                Release panel below, then prepare this release again.
+              </p>
+            )}
+          </>
+        )}
       </div>
     </Card>
   )

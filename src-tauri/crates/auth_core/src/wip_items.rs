@@ -14,9 +14,11 @@ pub struct WipItem {
     pub id: i64,
     pub repository: String,
     pub branch: String,
-    /// `feature` | `bug` | `chore` | `hotfix`.
+    /// `feature` | `bug` | `chore` | `hotfix` | `release`.
     pub work_type: String,
-    /// `active` | `waiting` | `completed` | `dropped`.
+    /// `active` | `waiting` | `completed` | `dropped` | `superseded`
+    /// (`superseded`: a release candidate replaced by a newer one -- column is
+    /// free TEXT with no CHECK, so this needs no migration).
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
@@ -99,6 +101,20 @@ impl WipItemLog {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![repository], row_to_item)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every row for `(repository, work_type)` regardless of status, newest
+    /// first. Lets the release UI list superseded candidates, which
+    /// `actionable` deliberately hides.
+    pub fn by_type(&self, repository: &str, work_type: &str) -> Result<Vec<WipItem>, AuditError> {
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM wip_items
+             WHERE repository = ?1 AND work_type = ?2
+             ORDER BY id DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![repository, work_type], row_to_item)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -190,6 +206,25 @@ mod tests {
         log.set_status("/a", "feature/old", "dropped").unwrap();
         log.backfill("/a", "feature/old", "feature").unwrap();
         assert!(log.actionable("/a").unwrap().is_empty(), "dropped stays dropped");
+    }
+
+    #[test]
+    fn by_type_returns_all_statuses_incl_superseded() {
+        let (_d, log) = open_log();
+        log.start("/a", "release/1.4.0", "release").unwrap();
+        log.start("/a", "release/1.4.0-2", "release").unwrap();
+        log.set_status("/a", "release/1.4.0", "superseded").unwrap();
+        log.start("/a", "feature/x", "feature").unwrap();
+
+        let rows = log.by_type("/a", "release").unwrap();
+        assert_eq!(rows.len(), 2);
+        // newest first
+        assert_eq!(rows[0].branch, "release/1.4.0-2");
+        assert_eq!(rows[1].status, "superseded");
+        // actionable still hides the superseded one
+        let act: Vec<_> = log.actionable("/a").unwrap().into_iter().map(|i| i.branch).collect();
+        assert!(act.contains(&"release/1.4.0-2".to_string()));
+        assert!(!act.contains(&"release/1.4.0".to_string()));
     }
 
     #[test]
