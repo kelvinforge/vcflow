@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0 — 2026-08-31
+
+### Features
+- feat(release): tag origin/<production> when syncing develop after a release
+
 ## 0.3.0 — 2026-08-31
 
 ### Features
