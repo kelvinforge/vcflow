@@ -56,7 +56,12 @@ jobs:
       # Homebrew ships openssl@3 on the macOS runners; point the build at it.
       - name: Configure OpenSSL (macOS)
         if: runner.os == 'macOS'
-        run: echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+        run: |
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          echo "OPENSSL_DIR=$OPENSSL_PREFIX" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$OPENSSL_PREFIX/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          echo "LDFLAGS=-L$OPENSSL_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "CPPFLAGS=-I$OPENSSL_PREFIX/include" >> "$GITHUB_ENV"
 
       - uses: tauri-apps/tauri-action@v0
         env:
