@@ -5,7 +5,7 @@
 // button say and which command does it call".
 
 import type { LucideIcon } from "lucide-react"
-import { GitCommitVertical, GitPullRequestArrow, Play, Rocket, TriangleAlert, Undo2, Upload } from "lucide-react"
+import { ArrowDownToLine, GitCommitVertical, GitPullRequestArrow, Play, Rocket, TriangleAlert, Undo2, Upload } from "lucide-react"
 import {
   createWorkItem,
   finishHotfix,
@@ -13,6 +13,7 @@ import {
   finishWorkItem,
   commitWorkItem,
   pushWorkItem,
+  updateBranch,
   type PrimaryActionId,
   type WorkItemKind,
 } from "@/lib/tauri"
@@ -105,5 +106,12 @@ export const ACTIONS: Record<PrimaryActionId, ActionDef> = {
     icon: Undo2,
     kind: "guidance",
     fields: [],
+  },
+  update_branch: {
+    label: "Update branch (fast-forward pull)",
+    icon: ArrowDownToLine,
+    kind: "trigger",
+    fields: [],
+    run: ({ repoPath }) => updateBranch(repoPath),
   },
 }

@@ -57,6 +57,7 @@ export type PrimaryActionId =
   | "finish_release"
   | "sync_develop"
   | "return_to_develop"
+  | "update_branch"
   | "start_work_item"
 
 export interface NextActionDto {
@@ -93,6 +94,12 @@ export function pushWorkItem(repoPath: string): Promise<RepoStatus> {
 
 export function finishWorkItem(repoPath: string, title: string): Promise<RepoStatus> {
   return invoke<RepoStatus>("finish_work_item", { repoPath, title })
+}
+
+/** Fast-forward develop / production to origin. Backend refuses on any other
+ *  branch, a dirty tree, or a divergence. */
+export function updateBranch(repoPath: string): Promise<RepoStatus> {
+  return invoke<RepoStatus>("update_branch", { repoPath })
 }
 
 // --- MR / Hotfix status --------------------------------------------------
