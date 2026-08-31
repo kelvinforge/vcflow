@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 — 2026-08-31
+
+### Other
+- chore: harden release workflow target detection and concurrency
+- chore: add manual trigger and artifact upload to release workflow
+
 ## 0.2.1 — 2026-08-31
 
 ### Other
