@@ -2832,9 +2832,50 @@ pub async fn finish_release(
     Ok(RepoStatusWithPath { status, repo_path })
 }
 
-/// Owner-only: opens the `production -> develop` sync MR for a merged release
-/// candidate. Surfaced by the Active Release panel only after that candidate's
-/// production MR has actually merged (D3 remediation path too).
+/// AppHandle- and provider-free core of `sync_develop_after_release`'s tagging
+/// step, so it is directly testable. Given that the production MR merge is
+/// *already confirmed* by the caller, fetch `origin` and idempotently publish
+/// the `v<version>` tag on `origin/<production>`.
+///
+/// `production_mr_merged == false` is a hard stop -- no fetch, no tag. The
+/// version comes from `version_from_release_branch` (drops any `-N` supersede
+/// suffix), so a superseded candidate still tags the plain `vX.Y.Z`.
+fn sync_release_tag_inner(
+    repo_path: &str,
+    candidate_branch: &str,
+    production_mr_merged: bool,
+) -> Result<git_core::TagOutcome, String> {
+    if !production_mr_merged {
+        return Err("the release's production merge request is not merged yet -- merge it before \
+                    syncing develop"
+            .into());
+    }
+
+    let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
+    let production = resolve_production(&repo)?;
+    let _ = git_core::fetch_origin(&repo);
+
+    let version = version_from_release_branch(candidate_branch);
+    if version.is_empty() {
+        return Err(format!("could not derive a version from '{candidate_branch}'"));
+    }
+    let tag = format!("v{version}");
+    let target = format!("refs/remotes/origin/{production}");
+
+    run_git(repo_path, "tag_release", &tag, || {
+        git_core::ensure_release_tag(&repo, &tag, &target, &format!("Release {version}"))
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Owner-only: tags the shipped release on `origin/<production>` and opens the
+/// `production -> develop` sync MR for a merged release candidate. Surfaced by
+/// the Active Release panel only after that candidate's production MR has
+/// actually merged (D3 remediation path too).
+///
+/// The production-merge state is re-confirmed here against the provider -- the
+/// frontend `sync_required` gate is a hint, not the authority. Safe for an
+/// Owner to retry: an existing tag and an already-open sync MR are both no-ops.
 #[tauri::command]
 pub async fn sync_develop_after_release(
     app: AppHandle,
@@ -2852,15 +2893,35 @@ pub async fn sync_develop_after_release(
     let client = provider_client_for(&remote_url)
         .await
         .ok_or("could not reach the provider API for this remote (check token/host)")?;
-    let mr = client
-        .create_merge_request(&production, "develop", &format!("sync: {title}"))
-        .await
-        .map_err(|e| e.to_string())?;
 
-    if let Some(log) = work_item_log() {
-        log.add_mr(&repo_path, &candidate_branch, "develop", &mr.id).ok();
-    }
-    audit_best_effort(&repo_path, "sync_develop_after_release", &candidate_branch, Some(&mr.id));
+    // Re-confirm the production MR is merged before tagging anything.
+    let prod_mr = candidate_production_mr(&repo_path, &candidate_branch, &production)
+        .ok_or("no production merge request is tracked for this release candidate")?;
+    let merged = mr_snapshot(&client, &prod_mr).await.map(|m| m.merged).unwrap_or(false);
+    sync_release_tag_inner(&repo_path, &candidate_branch, merged)?;
+
+    // Reuse an already-open sync MR on retry rather than opening a duplicate.
+    let existing_sync = work_item_log()
+        .and_then(|log| log.mrs_for_branch(&repo_path, &candidate_branch).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .find(|m| m.target_branch == "develop")
+        .map(|m| m.mr_iid);
+
+    let mr_id = match existing_sync {
+        Some(id) => id,
+        None => {
+            let mr = client
+                .create_merge_request(&production, "develop", &format!("sync: {title}"))
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Some(log) = work_item_log() {
+                log.add_mr(&repo_path, &candidate_branch, "develop", &mr.id).ok();
+            }
+            mr.id
+        }
+    };
+    audit_best_effort(&repo_path, "sync_develop_after_release", &candidate_branch, Some(&mr_id));
 
     build_and_emit_status(&app, &repo_path).await
 }
@@ -3249,6 +3310,50 @@ mod tests {
             n += 1;
         }
         assert_eq!(name, "release/1.4.0-2");
+    }
+
+    #[test]
+    fn sync_release_tag_needs_a_confirmed_merge() {
+        let (_origin, work) = repo_with_origin();
+        let rp = work.path().to_str().unwrap();
+
+        let err = sync_release_tag_inner(rp, "release/0.2.3", false).unwrap_err();
+        assert!(err.contains("not merged"));
+        // nothing was tagged, locally or on origin.
+        assert!(Repository::open(work.path())
+            .unwrap()
+            .revparse_single("refs/tags/v0.2.3")
+            .is_err());
+    }
+
+    #[test]
+    fn sync_release_tag_tags_the_production_tip_once_merged() {
+        let (_origin, work) = repo_with_origin();
+        let rp = work.path().to_str().unwrap();
+        let prod_tip = git_out(work.path(), &["rev-parse", "refs/remotes/origin/main"]);
+
+        let outcome = sync_release_tag_inner(rp, "release/0.2.3-2", true).unwrap();
+        assert_eq!(outcome, git_core::TagOutcome::Created);
+        // supersede suffix dropped -> plain vX.Y.Z, pointing at origin/main.
+        assert_eq!(git_out(work.path(), &["rev-parse", "v0.2.3^{commit}"]), prod_tip);
+    }
+
+    #[test]
+    fn sync_release_tag_is_idempotent_on_retry() {
+        let (_origin, work) = repo_with_origin();
+        let rp = work.path().to_str().unwrap();
+
+        sync_release_tag_inner(rp, "release/0.2.3", true).unwrap();
+        let first = git_out(work.path(), &["rev-parse", "v0.2.3"]);
+
+        // production moves on; a retry must not re-point the shipped tag.
+        std::fs::write(work.path().join("a.txt"), "more\n").unwrap();
+        git(work.path(), &["commit", "-am", "more"]);
+        git(work.path(), &["push", "origin", "main"]);
+
+        let outcome = sync_release_tag_inner(rp, "release/0.2.3", true).unwrap();
+        assert_eq!(outcome, git_core::TagOutcome::AlreadyPresent);
+        assert_eq!(git_out(work.path(), &["rev-parse", "v0.2.3"]), first);
     }
 
     // --- Workflow Guard -------------------------------------------------

@@ -16,6 +16,7 @@ mod save_work;
 mod ssh;
 mod status;
 mod sync;
+mod tag;
 mod version;
 
 pub use branch::{checkout_branch, create_work_branch, slugify, BranchError, BranchKind};
@@ -43,4 +44,7 @@ pub use save_work::{discard_work, restore_work, save_work, SavedWork, SaveWorkEr
 pub use ssh::{validate_remote_connection, SshError};
 pub use status::{read_working_tree_status, RenamedFile, StatusError, WorkingTreeStatus};
 pub use sync::{fast_forward_from_origin, FastForward, SyncError};
+pub use tag::{
+    create_annotated_tag, ensure_release_tag, push_tag, remote_tag_exists, TagError, TagOutcome,
+};
 pub use version::{read_version_file, write_version_file, BumpKind, Version, VersionError};
