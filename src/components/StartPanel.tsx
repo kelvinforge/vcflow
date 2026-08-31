@@ -43,6 +43,7 @@ export function StartPanel({
   repoPath,
   currentBranch,
   developInSync = false,
+  developIdle = false,
   onChanged,
   extra,
 }: {
@@ -51,6 +52,8 @@ export function StartPanel({
   currentBranch?: string | null
   /** develop has no ahead/behind/divergence vs origin/develop. */
   developInSync?: boolean
+  /** No pending workflow action on develop (e.g. not "Update develop"). */
+  developIdle?: boolean
   onChanged: () => void
   /** Extra card rendered alongside the entry-point cards (e.g. branch inspector). */
   extra?: ReactNode
@@ -64,7 +67,7 @@ export function StartPanel({
   const [releaseGate, setReleaseGate] = useState<ReleasePreview | null>(null)
   const onDevelop = currentBranch === "develop"
   useEffect(() => {
-    if (!onDevelop || !developInSync) {
+    if (!onDevelop || !developInSync || !developIdle) {
       setReleaseGate(null)
       return
     }
@@ -75,11 +78,12 @@ export function StartPanel({
     return () => {
       live = false
     }
-  }, [repoPath, onDevelop, developInSync])
+  }, [repoPath, onDevelop, developInSync, developIdle])
 
   const canPrepareRelease =
     onDevelop &&
     developInSync &&
+    developIdle &&
     releaseGate != null &&
     releaseGate.commit_count > 0 &&
     releaseGate.production_commits_not_in_develop === 0
