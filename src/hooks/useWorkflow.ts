@@ -4,6 +4,7 @@ import {
   getHotfixStatus,
   getMrStatus,
   getNextAction,
+  getReleaseStatus,
   getRepoStatus,
   inspectBranch,
   onWorkflowStateChanged,
@@ -12,6 +13,7 @@ import {
   type InspectTarget,
   type MrStatus,
   type NextActionDto,
+  type ReleaseStatusDto,
   type RepoStatus,
 } from "@/lib/tauri"
 
@@ -28,6 +30,7 @@ export interface WorkflowState {
   nextAction: NextActionDto | null
   mr: MrStatus | null
   hotfix: HotfixStatus | null
+  release: ReleaseStatusDto | null
   lastRefreshed: number | null
   refreshing: boolean
   error: string | null
@@ -71,6 +74,7 @@ export function useWorkflow(initialRepoPath: string): WorkflowState {
   const [nextAction, setNextAction] = useState<NextActionDto | null>(null)
   const [mr, setMr] = useState<MrStatus | null>(null)
   const [hotfix, setHotfix] = useState<HotfixStatus | null>(null)
+  const [release, setRelease] = useState<ReleaseStatusDto | null>(null)
   const [lastRefreshed, setLastRefreshed] = useState<number | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -103,18 +107,23 @@ export function useWorkflow(initialRepoPath: string): WorkflowState {
       // Branch-prefix check only skips a pointless call -- it is not a workflow
       // decision (that is get_next_action).
       const isHotfix = statusRef.current?.branch.startsWith("hotfix/") ?? false
-      const [na, mrs, hfs] = await Promise.all([
+      // Release lifecycle continues after the developer is parked back on
+      // develop, so it can't be gated on a branch prefix -- ask every time
+      // (the backend returns null cheaply when no candidate is tracked).
+      const [na, mrs, hfs, rel] = await Promise.all([
         getNextAction(repo).catch((): NextActionDto | null => null),
         getMrStatus(repo).catch((): MrStatus | null => null),
         isHotfix
           ? getHotfixStatus(repo).catch((): HotfixStatus | null => null)
           : Promise.resolve<HotfixStatus | null>(null),
+        getReleaseStatus(repo).catch((): ReleaseStatusDto | null => null),
       ])
       // Drop stale results: a newer snapshot read already started.
       if (gen !== snapshotGen.current || repoRef.current !== repo) return
       setNextAction(na)
       setMr(mrs)
       setHotfix(hfs)
+      setRelease(rel)
       lastRefreshedRef.current = Date.now()
       setLastRefreshed(lastRefreshedRef.current)
       bumpTick()
@@ -160,6 +169,12 @@ export function useWorkflow(initialRepoPath: string): WorkflowState {
     try {
       const s = await refreshRepoStatus(repo)
       applyStatus(repo, s)
+      // "Refreshed Xm ago" tracks the origin fetch, which always runs here --
+      // refreshSnapshot can gen-drop under a race and never reach its own set.
+      if (repoRef.current === repo) {
+        lastRefreshedRef.current = Date.now()
+        setLastRefreshed(lastRefreshedRef.current)
+      }
       // Fallback path: nudge self-owned panels (WorkPanel) so the 15s loop
       // still retires merged/deleted branches even with no backend event.
       bumpTick()
@@ -238,8 +253,12 @@ export function useWorkflow(initialRepoPath: string): WorkflowState {
     setNextAction(null)
     setMr(null)
     setHotfix(null)
+    setRelease(null)
     setError(null)
     setLastRefreshed(null)
+    // Inspection is per-repo: never carry repo A's parked-branch session to B.
+    setInspection(null)
+    inspectingRef.current = false
     setRepoPathState(trimmed)
   }, [])
 
@@ -294,6 +313,7 @@ export function useWorkflow(initialRepoPath: string): WorkflowState {
     nextAction,
     mr,
     hotfix,
+    release,
     lastRefreshed,
     refreshing,
     error,

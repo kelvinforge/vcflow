@@ -8,7 +8,7 @@ import {
   type ReactNode,
   type TextareaHTMLAttributes,
 } from "react"
-import { ChevronDown, ChevronRight, Copy } from "lucide-react"
+import { ChevronDown, ChevronRight, Copy, HelpCircle } from "lucide-react"
 import { cn } from "@/lib/utils"
 
 type Variant = "primary" | "secondary" | "destructive"
@@ -115,6 +115,37 @@ export function Section({
       </div>
       {open && <div className="border-t border-border px-3 py-3">{children}</div>}
     </div>
+  )
+}
+
+/**
+ * "?" marker that reveals `text` on click. Click, not hover, so it is
+ * keyboard- and touch-reachable; blur or a second click dismisses. No
+ * popover library.
+ */
+export function Help({ text }: { text: string }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <span className="relative inline-flex">
+      <button
+        type="button"
+        aria-label={open ? undefined : `Explain: ${text}`}
+        aria-expanded={open}
+        className="-m-2 inline-flex p-2 text-muted-foreground/60 hover:text-foreground"
+        onClick={() => setOpen((o) => !o)}
+        onBlur={() => setOpen(false)}
+      >
+        <HelpCircle size={14} />
+      </button>
+      {open && (
+        <span
+          role="tooltip"
+          className="absolute left-0 top-full z-50 mt-1 w-64 rounded border border-border bg-card p-2 text-xs font-normal text-muted-foreground shadow-md"
+        >
+          {text}
+        </span>
+      )}
+    </span>
   )
 }
 

@@ -1,4 +1,5 @@
 mod branch;
+mod changelog;
 mod commit_push;
 mod conflict_verify;
 mod divergence;
@@ -7,6 +8,8 @@ mod hotfix;
 mod merge;
 mod op_state;
 mod preflight;
+mod release;
+mod release_scope;
 mod repo;
 mod repo_state;
 mod save_work;
@@ -16,6 +19,7 @@ mod sync;
 mod version;
 
 pub use branch::{checkout_branch, create_work_branch, BranchError, BranchKind};
+pub use changelog::prepend_section;
 pub use commit_push::{commit_all, commit_merge, push, CommitPushError};
 pub use conflict_verify::{verify_resolved, Issue, VerifyError};
 pub use divergence::{compare_refs, Divergence, DivergenceError};
@@ -26,7 +30,14 @@ pub use op_state::{in_progress_operation, InProgressOp};
 pub use preflight::{
     assemble_preflight, Check, CheckStatus, Preflight, PreflightProvider,
 };
-pub use repo::{head_branch, is_dirty, production_branch, read_repo_info, RepoError, RepoInfo};
+pub use release::{create_release_branch, ReleaseError};
+pub use release_scope::{
+    changelog_seed, commits_to_release, conventional_bump, suggest_version, Bump, CommitInfo,
+};
+pub use repo::{
+    head_branch, is_dirty, production_branch, read_file_at_ref, read_repo_info, ref_exists,
+    RepoError, RepoInfo,
+};
 pub use repo_state::{read_repository_state, RepoStateError, RepositoryState};
 pub use save_work::{discard_work, restore_work, save_work, SavedWork, SaveWorkError};
 pub use ssh::{validate_remote_connection, SshError};

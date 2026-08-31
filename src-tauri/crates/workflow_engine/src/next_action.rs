@@ -11,6 +11,11 @@ pub struct WorkflowSnapshot {
     /// Label of a half-finished git op (`merge`/`rebase`/...), if any.
     pub in_progress_op: Option<String>,
     pub dirty: bool,
+    /// Local commits on the current branch that `origin/<branch>` lacks.
+    pub ahead: usize,
+    /// Commits on `origin/<branch>` the local branch lacks -- a plain
+    /// fast-forward pull catches up (only actioned for develop/production).
+    pub behind: usize,
     /// Current branch vs `origin/<branch>`: both sides carry unique commits.
     /// Work Safe: never auto-resolved.
     pub diverged: bool,
@@ -22,6 +27,9 @@ pub enum BranchClass {
     /// `feature/*`, `bug/*`, `chore/*`.
     WorkItem,
     Hotfix,
+    /// `release/x.y.z[-N]` -- a short-lived release-preparation branch. Not a
+    /// development branch: it carries only VERSION + CHANGELOG.
+    Release,
     Develop,
     Master,
     Other,
@@ -53,13 +61,27 @@ pub enum PrimaryAction {
     /// Owner-only: start conflict resolution for the MR.
     ResolveMrConflict,
     Commit,
+    /// Push the current branch to `origin` (follow-up commits onto an open MR).
+    Push,
     /// Push + open the work-item MR into `develop`, in one gated step.
     Finish,
     /// Push + open the hotfix MR into `master` (and the `master -> develop`
     /// sync MR), in one gated step. Distinct from `Finish` so the frontend
     /// never has to inspect the branch prefix to pick the command.
     FinishHotfix,
+    /// Push + open the `release/x.y.z -> production` MR, in one gated step.
+    /// The `production -> develop` sync is a separate action (`SyncDevelop`),
+    /// surfaced only after a candidate actually merges.
+    FinishRelease,
+    /// Owner-only: open the `production -> develop` sync MR after a release
+    /// candidate merged. Never emitted by `next_action` -- the Active Release
+    /// panel drives it; the variant exists so the command layer has one id.
+    SyncDevelop,
     ReturnToDevelop,
+    /// Fast-forward the current branch to `origin/<branch>`. Only offered on
+    /// develop / production when it is behind, clean, and not diverged -- a
+    /// pure pull that never touches uncommitted work.
+    UpdateBranch,
     StartWorkItem,
 }
 
@@ -126,13 +148,85 @@ pub fn next_action(s: &WorkflowSnapshot) -> NextAction {
         }
     }
 
-    match s.work_item {
-        WorkItemState::PushedForReview => NextAction {
-            title: "Waiting for review".into(),
-            description: "Your merge request is open. Wait for review and pipeline to pass.".into(),
-            primary: None,
+    // Keep develop / production current: if HEAD is one of them, behind origin,
+    // clean and not diverged, a fast-forward pull is the next step -- before
+    // starting any work off a stale base.
+    if matches!(s.branch, BranchClass::Develop | BranchClass::Master)
+        && s.behind > 0
+        && !s.dirty
+    {
+        let name = if s.branch == BranchClass::Develop { "develop" } else { "the production branch" };
+        return NextAction {
+            title: format!("Update {name}"),
+            description: format!(
+                "{name} is {} commit(s) behind origin. Fast-forward it so new work starts from \
+                 the current base.",
+                s.behind
+            ),
+            primary: Some(PrimaryAction::UpdateBranch),
             helper: None,
-        },
+        };
+    }
+
+    // A release-preparation branch has only three states here: a half-done op
+    // or divergence (handled above), a dirty tree (product code that doesn't
+    // belong -- no Commit offered), or clean and ready to finish.
+    if s.branch == BranchClass::Release {
+        if s.dirty {
+            return NextAction {
+                title: "Release branches carry only VERSION and CHANGELOG".into(),
+                description: "There are uncommitted changes on this release branch. Product code \
+                              belongs on a bug/* branch off develop, not here -- this tool will \
+                              not commit it on a release branch."
+                    .into(),
+                primary: None,
+                helper: Some(
+                    "Save your work, switch back to develop, and start a bug/* branch for it."
+                        .into(),
+                ),
+            };
+        }
+        return NextAction {
+            title: "Finish the release".into(),
+            description: "VERSION and CHANGELOG are committed. Push the branch and open the \
+                          release merge request into the production branch. The \
+                          production -> develop sync is a separate step once it merges."
+                .into(),
+            primary: Some(PrimaryAction::FinishRelease),
+            helper: None,
+        };
+    }
+
+    match s.work_item {
+        WorkItemState::PushedForReview => {
+            if s.dirty {
+                NextAction {
+                    title: "Commit your follow-up changes".into(),
+                    description: "You have new uncommitted work on this branch while the merge \
+                                  request is open. Commit it, then push to update the MR."
+                        .into(),
+                    primary: Some(PrimaryAction::Commit),
+                    helper: None,
+                }
+            } else if s.ahead > 0 {
+                NextAction {
+                    title: "Push your follow-up commits".into(),
+                    description: "You have local commits the open merge request doesn't have yet. \
+                                  Push the branch to update it."
+                        .into(),
+                    primary: Some(PrimaryAction::Push),
+                    helper: None,
+                }
+            } else {
+                NextAction {
+                    title: "Waiting for review".into(),
+                    description: "Your merge request is open. Wait for review and pipeline to pass."
+                        .into(),
+                    primary: None,
+                    helper: None,
+                }
+            }
+        }
         WorkItemState::Developing => {
             if s.dirty {
                 NextAction {
@@ -186,6 +280,8 @@ mod tests {
             work_item: WorkItemState::Developing,
             in_progress_op: None,
             dirty: false,
+            ahead: 0,
+            behind: 0,
             diverged: false,
             mr: None,
         }
@@ -241,6 +337,60 @@ mod tests {
     }
 
     #[test]
+    fn develop_behind_offers_fast_forward_pull() {
+        let s = WorkflowSnapshot {
+            branch: BranchClass::Develop,
+            work_item: WorkItemState::NotStarted,
+            behind: 3,
+            ..base()
+        };
+        assert_eq!(next_action(&s).primary, Some(PrimaryAction::UpdateBranch));
+
+        // Dirty -> no auto pull; in sync -> not offered.
+        let dirty = WorkflowSnapshot { dirty: true, ..s.clone() };
+        assert_ne!(next_action(&dirty).primary, Some(PrimaryAction::UpdateBranch));
+        let synced = WorkflowSnapshot { behind: 0, ..s };
+        assert_eq!(next_action(&synced).primary, Some(PrimaryAction::StartWorkItem));
+    }
+
+    #[test]
+    fn work_branch_behind_is_not_auto_pulled() {
+        let s = WorkflowSnapshot { branch: BranchClass::WorkItem, behind: 2, ..base() };
+        assert_ne!(next_action(&s).primary, Some(PrimaryAction::UpdateBranch));
+    }
+
+    #[test]
+    fn release_dirty_gives_guidance_clean_finishes() {
+        let dirty = WorkflowSnapshot {
+            branch: BranchClass::Release,
+            work_item: WorkItemState::NotStarted,
+            dirty: true,
+            ..base()
+        };
+        let a = next_action(&dirty);
+        assert_eq!(a.primary, None);
+        assert!(a.helper.is_some());
+
+        let clean = WorkflowSnapshot {
+            branch: BranchClass::Release,
+            work_item: WorkItemState::NotStarted,
+            ..base()
+        };
+        assert_eq!(next_action(&clean).primary, Some(PrimaryAction::FinishRelease));
+    }
+
+    #[test]
+    fn release_in_progress_op_still_wins() {
+        let s = WorkflowSnapshot {
+            branch: BranchClass::Release,
+            in_progress_op: Some("rebase".into()),
+            dirty: true,
+            ..base()
+        };
+        assert_eq!(next_action(&s).primary, Some(PrimaryAction::ResolveInWorkingDir));
+    }
+
+    #[test]
     fn merged_mr_sends_user_back_to_develop() {
         let s = WorkflowSnapshot {
             work_item: WorkItemState::PushedForReview,
@@ -258,6 +408,27 @@ mod tests {
             ..base()
         };
         assert_eq!(next_action(&s).primary, None);
+    }
+
+    #[test]
+    fn pushed_for_review_dirty_commits_then_ahead_pushes() {
+        let mr = Some(MrSnapshot { merged: false, conflicted: false });
+
+        let dirty = WorkflowSnapshot {
+            work_item: WorkItemState::PushedForReview,
+            dirty: true,
+            mr,
+            ..base()
+        };
+        assert_eq!(next_action(&dirty).primary, Some(PrimaryAction::Commit));
+
+        let ahead = WorkflowSnapshot {
+            work_item: WorkItemState::PushedForReview,
+            ahead: 2,
+            mr,
+            ..base()
+        };
+        assert_eq!(next_action(&ahead).primary, Some(PrimaryAction::Push));
     }
 
     #[test]

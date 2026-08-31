@@ -4,6 +4,7 @@ mod events;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    .plugin(tauri_plugin_dialog::init())
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -50,6 +51,12 @@ pub fn run() {
       commands::get_audit_log,
       commands::get_command_log,
       commands::get_hotfix_version_preview,
+      commands::get_release_preview,
+      commands::create_release_candidate,
+      commands::finish_release,
+      commands::sync_develop_after_release,
+      commands::get_release_status,
+      commands::update_branch,
       commands::open_working_directory,
       commands::open_url
     ])

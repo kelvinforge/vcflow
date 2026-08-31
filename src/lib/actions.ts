@@ -5,12 +5,15 @@
 // button say and which command does it call".
 
 import type { LucideIcon } from "lucide-react"
-import { GitCommitVertical, GitPullRequestArrow, Play, Rocket, TriangleAlert, Undo2 } from "lucide-react"
+import { ArrowDownToLine, GitCommitVertical, GitPullRequestArrow, Play, Rocket, TriangleAlert, Undo2, Upload } from "lucide-react"
 import {
   createWorkItem,
   finishHotfix,
+  finishRelease,
   finishWorkItem,
   commitWorkItem,
+  pushWorkItem,
+  updateBranch,
   type PrimaryActionId,
   type WorkItemKind,
 } from "@/lib/tauri"
@@ -42,6 +45,13 @@ export const ACTIONS: Record<PrimaryActionId, ActionDef> = {
     fields: ["message"],
     run: ({ repoPath, values }) => commitWorkItem(repoPath, values.message ?? ""),
   },
+  push: {
+    label: "Push to update MR",
+    icon: Upload,
+    kind: "trigger",
+    fields: [],
+    run: ({ repoPath }) => pushWorkItem(repoPath),
+  },
   finish: {
     label: "Finish (push + open MR)",
     icon: GitPullRequestArrow,
@@ -55,6 +65,20 @@ export const ACTIONS: Record<PrimaryActionId, ActionDef> = {
     kind: "trigger",
     fields: ["title"],
     run: ({ repoPath, values }) => finishHotfix(repoPath, values.title ?? ""),
+  },
+  finish_release: {
+    label: "Submit release (push + open MR → production)",
+    icon: Rocket,
+    kind: "trigger",
+    fields: ["title"],
+    run: ({ repoPath, values }) => finishRelease(repoPath, values.title ?? ""),
+  },
+  // Panel-button only (Active Release panel), never surfaced by NextActionCard.
+  sync_develop: {
+    label: "Sync develop",
+    icon: Undo2,
+    kind: "guidance",
+    fields: [],
   },
   start_work_item: {
     label: "Start work item",
@@ -82,5 +106,12 @@ export const ACTIONS: Record<PrimaryActionId, ActionDef> = {
     icon: Undo2,
     kind: "guidance",
     fields: [],
+  },
+  update_branch: {
+    label: "Update branch (fast-forward pull)",
+    icon: ArrowDownToLine,
+    kind: "trigger",
+    fields: [],
+    run: ({ repoPath }) => updateBranch(repoPath),
   },
 }

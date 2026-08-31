@@ -27,6 +27,8 @@ export interface RepoStatus {
   ahead: number
   behind: number
   diverged: boolean
+  /** The repo's production branch: "main" or "master", whichever exists. */
+  production_branch: string
 }
 
 export interface RepoStatusWithPath {
@@ -49,9 +51,13 @@ export type PrimaryActionId =
   | "resolve_in_working_dir"
   | "resolve_mr_conflict"
   | "commit"
+  | "push"
   | "finish"
   | "finish_hotfix"
+  | "finish_release"
+  | "sync_develop"
   | "return_to_develop"
+  | "update_branch"
   | "start_work_item"
 
 export interface NextActionDto {
@@ -88,6 +94,12 @@ export function pushWorkItem(repoPath: string): Promise<RepoStatus> {
 
 export function finishWorkItem(repoPath: string, title: string): Promise<RepoStatus> {
   return invoke<RepoStatus>("finish_work_item", { repoPath, title })
+}
+
+/** Fast-forward develop / production to origin. Backend refuses on any other
+ *  branch, a dirty tree, or a divergence. */
+export function updateBranch(repoPath: string): Promise<RepoStatus> {
+  return invoke<RepoStatus>("update_branch", { repoPath })
 }
 
 // --- MR / Hotfix status --------------------------------------------------
@@ -128,6 +140,81 @@ export interface VersionPreview {
 
 export function getHotfixVersionPreview(repoPath: string): Promise<VersionPreview> {
   return invoke<VersionPreview>("get_hotfix_version_preview", { repoPath })
+}
+
+// --- Release workflow --------------------------------------------------
+
+export interface PendingCandidate {
+  branch: string
+  version: string
+  mr_iid: string
+  merged: boolean
+}
+
+export interface ReleasePreview {
+  current_version: string
+  commit_count: number
+  /** "major" | "minor" | "patch". */
+  impact: string
+  suggested_version: string
+  /** Markdown lines to prefill the CHANGELOG textarea. */
+  changelog_seed: string[]
+  pending_candidates: PendingCandidate[]
+}
+
+export interface SupersededCandidate {
+  version: string
+  branch: string
+  mr_iid: string
+  web_url: string | null
+}
+
+export interface ReleaseStatusDto {
+  version: string
+  candidate_branch: string
+  production: MrStatus | null
+  sync: MrStatus | null
+  /** Production MR merged, no sync MR yet -> show [Sync Develop]. */
+  sync_required: boolean
+  complete: boolean
+  superseded: SupersededCandidate[]
+}
+
+export function getReleasePreview(repoPath: string): Promise<ReleasePreview> {
+  return invoke<ReleasePreview>("get_release_preview", { repoPath })
+}
+
+/** Throws with a "SYNC_REQUIRED: …" or "SUPERSEDE_REQUIRED: …" prefixed
+ *  message the caller classifies. */
+export function createReleaseCandidate(
+  repoPath: string,
+  version: string,
+  changelogBody: string,
+  supersedeConfirmed: boolean,
+): Promise<RepoStatusWithPath> {
+  return invoke<RepoStatusWithPath>("create_release_candidate", {
+    repoPath,
+    version,
+    changelogBody,
+    supersedeConfirmed,
+  })
+}
+
+export function finishRelease(repoPath: string, title: string): Promise<RepoStatusWithPath> {
+  return invoke<RepoStatusWithPath>("finish_release", { repoPath, title })
+}
+
+export function syncDevelopAfterRelease(
+  repoPath: string,
+  candidateBranch: string,
+  title: string,
+): Promise<RepoStatus> {
+  return invoke<RepoStatus>("sync_develop_after_release", { repoPath, candidateBranch, title })
+}
+
+/** null => no release candidate tracked for this repo. */
+export function getReleaseStatus(repoPath: string): Promise<ReleaseStatusDto | null> {
+  return invoke<ReleaseStatusDto | null>("get_release_status", { repoPath })
 }
 
 // --- Saved Work (Work Safe) --------------------------------------------
@@ -204,9 +291,11 @@ export function continueWork(repoPath: string, workItemId: number): Promise<Cont
   return invoke<ContinueOutcome>("continue_work", { repoPath, workItemId })
 }
 
-// --- Temporary branch inspection (develop / master) -----------------
+// --- Temporary branch inspection (develop / production branch) ----------
 
-export type InspectTarget = "develop" | "master"
+/** "develop" or the repo's production branch (main/master) — resolved at
+ *  runtime from RepoStatus.production_branch, not a fixed union. */
+export type InspectTarget = string
 
 export interface InspectionOutcome {
   status: RepoStatus
@@ -367,6 +456,13 @@ export function openWorkingDirectory(repoPath: string): Promise<void> {
 
 export function openUrl(url: string): Promise<void> {
   return invoke<void>("open_url", { url })
+}
+
+/** Native OS folder picker. Returns the chosen path, or null if cancelled. */
+export async function pickRepo(): Promise<string | null> {
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const picked = await open({ directory: true, multiple: false })
+  return typeof picked === "string" ? picked : null
 }
 
 // --- Setup gate (Preflight + Initial Workflow, in front of the workflow) ---

@@ -87,7 +87,7 @@ fn hotfix_flow_bumps_version_off_master() {
     commit_file(dir.path(), "VERSION", "1.4.2\n", "chore: version");
     let repo = Repository::open(dir.path()).unwrap();
 
-    let branch = create_hotfix_branch(&repo, "urgent-fix").unwrap();
+    let branch = create_hotfix_branch(&repo, "urgent-fix", "master").unwrap();
     assert_eq!(branch, "hotfix/urgent-fix");
     assert_eq!(read_repository_state(&repo).unwrap().current_branch, "hotfix/urgent-fix");
 

@@ -51,6 +51,19 @@ pub struct RepoStatus {
     pub behind: usize,
     /// Local and remote both carry unique commits -- never auto-resolved.
     pub diverged: bool,
+
+    /// The repo's production branch: `main` (GitHub default) or `master`
+    /// (GitLab default), whichever this repo actually has. `main` when neither
+    /// exists yet. The frontend uses this for branch-inspection targets instead
+    /// of assuming `master`.
+    pub production_branch: String,
+}
+
+/// Resolve the repo's production branch (`main`/`master`), erroring when the
+/// repo has neither -- a hard STOP for hotfix and inspection flows.
+fn resolve_production(repo: &Repository) -> Result<String, String> {
+    git_core::production_branch(repo)
+        .ok_or_else(|| "this repository has no 'main' or 'master' branch".to_string())
 }
 
 /// A `RepoStatus` plus the repo path it describes -- returned by the Hotfix
@@ -643,6 +656,14 @@ pub async fn push_work_item(app: AppHandle, repo_path: String) -> Result<RepoSta
     run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch)).map_err(|e| e.to_string())?;
 
     audit_best_effort(&repo_path, "push_work_item", &branch, None);
+
+    // This runs only for follow-up commits onto an already-open MR (the Push
+    // next-action). The MR now has everything -- park the user back on develop.
+    // Best-effort -- see finish_work_item.
+    let _ = run_git(&repo_path, "checkout", "develop", || {
+        git_core::checkout_branch(&repo, "develop")
+    });
+
     build_and_emit_status(&app, &repo_path).await
 }
 
@@ -683,6 +704,15 @@ pub async fn finish_work_item(
         log.set_status(&repo_path, &branch, "waiting").ok();
     }
     audit_best_effort(&repo_path, "finish_work_item", &branch, Some(&mr.id));
+
+    // MR is open; nothing more to do on the work branch. Park the user back on
+    // develop. Best-effort: the tree is clean here (Finish is only offered when
+    // committed) and the checkout is safe, but a missing local develop must not
+    // fail a finish whose MR already succeeded.
+    let _ = run_git(&repo_path, "checkout", "develop", || {
+        git_core::checkout_branch(&repo, "develop")
+    });
+
     build_and_emit_status(&app, &repo_path).await
 }
 
@@ -722,19 +752,20 @@ pub async fn create_hotfix(
     slug: String,
 ) -> Result<RepoStatusWithPath, String> {
     let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let production = resolve_production(&repo)?;
     guard_working_tree(&repo_path, &mut repo, &format!("creating hotfix/{slug}"))?;
 
-    // Bring local `master` current before branching off it. Fetch is
-    // best-effort; a real divergence is a hard STOP (Work Safe -- never
+    // Bring the local production branch current before branching off it. Fetch
+    // is best-effort; a real divergence is a hard STOP (Work Safe -- never
     // reconciled for the user).
     let _ = git_core::fetch_origin(&repo);
-    run_git(&repo_path, "fast_forward", "master", || {
-        git_core::fast_forward_from_origin(&repo, "master")
+    run_git(&repo_path, "fast_forward", &production, || {
+        git_core::fast_forward_from_origin(&repo, &production)
     })
     .map_err(|e| e.to_string())?;
 
     let branch_name = run_git(&repo_path, "create_hotfix_branch", &slug, || {
-        git_core::create_hotfix_branch(&repo, &slug)
+        git_core::create_hotfix_branch(&repo, &slug, &production)
     })
     .map_err(|e| e.to_string())?;
 
@@ -746,8 +777,9 @@ pub async fn create_hotfix(
     Ok(RepoStatusWithPath { status, repo_path })
 }
 
-/// Opens the `hotfix/* -> master` MR, then a separate `master -> develop`
-/// sync MR so the hotfix lands back on develop. Each MR is tracked and
+/// Opens the `hotfix/* -> <production>` MR, then a separate
+/// `<production> -> develop` sync MR so the hotfix lands back on develop.
+/// `<production>` is the repo's `main`/`master`. Each MR is tracked and
 /// merged independently -- no automatic merge, no worktree.
 #[tauri::command]
 pub async fn finish_hotfix(
@@ -756,6 +788,7 @@ pub async fn finish_hotfix(
     title: String,
 ) -> Result<RepoStatusWithPath, String> {
     let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let production = resolve_production(&repo)?;
     let branch = current_branch(&repo)?;
     run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch)).map_err(|e| e.to_string())?;
 
@@ -767,24 +800,30 @@ pub async fn finish_hotfix(
         .await
         .ok_or("could not reach the provider API for this remote (check token/host)")?;
 
-    let master_mr = client
-        .create_merge_request(&branch, "master", &title)
+    let prod_mr = client
+        .create_merge_request(&branch, &production, &title)
         .await
         .map_err(|e| e.to_string())?;
     let sync_mr = client
-        .create_merge_request("master", "develop", &format!("sync: {title}"))
+        .create_merge_request(&production, "develop", &format!("sync: {title}"))
         .await
         .map_err(|e| e.to_string())?;
 
     if let Some(log) = work_item_log() {
-        log.add_mr(&repo_path, &branch, "master", &master_mr.id).ok();
+        log.add_mr(&repo_path, &branch, &production, &prod_mr.id).ok();
         log.add_mr(&repo_path, &branch, "develop", &sync_mr.id).ok();
     }
     if let Some(log) = wip_item_log() {
         log.set_status(&repo_path, &branch, "waiting").ok();
     }
-    audit_best_effort(&repo_path, "finish_hotfix", &branch, Some(&master_mr.id));
+    audit_best_effort(&repo_path, "finish_hotfix", &branch, Some(&prod_mr.id));
     audit_best_effort(&repo_path, "finish_hotfix", &branch, Some(&sync_mr.id));
+
+    // Both MRs are open; park the user back on develop. Best-effort -- see
+    // finish_work_item.
+    let _ = run_git(&repo_path, "checkout", "develop", || {
+        git_core::checkout_branch(&repo, "develop")
+    });
 
     let status = build_and_emit_status(&app, &repo_path).await?;
     Ok(RepoStatusWithPath { status, repo_path })
@@ -811,14 +850,15 @@ pub async fn get_hotfix_status(repo_path: String) -> Result<Option<HotfixStatus>
         return Ok(None);
     };
 
+    let production = resolve_production(&repo)?;
     let mut master = None;
     let mut develop = None;
     for mr_ref in mrs {
         let status = fetch_mr_status(&client, &mr_ref.mr_iid).await.map_err(|e| e.to_string())?;
-        match mr_ref.target_branch.as_str() {
-            "master" => master = Some(status),
-            "develop" => develop = Some(status),
-            _ => {}
+        if mr_ref.target_branch == "develop" {
+            develop = Some(status);
+        } else if mr_ref.target_branch == production {
+            master = Some(status);
         }
     }
 
@@ -857,22 +897,30 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
     let branch = current_branch(&repo)?;
     let class = classify_branch(&branch);
 
-    let (dirty, in_progress_op, diverged) = match git_core::read_repository_state(&repo).ok() {
-        Some(s) => {
-            let up = s.upstream.unwrap_or_default();
-            (
-                s.working_tree.is_dirty(),
-                s.in_progress_op.map(|o| o.label().to_string()),
-                up.is_diverged(),
-            )
-        }
-        None => (false, None, false),
-    };
+    let (dirty, in_progress_op, ahead, behind, diverged) =
+        match git_core::read_repository_state(&repo).ok() {
+            Some(s) => {
+                let up = s.upstream.unwrap_or_default();
+                (
+                    s.working_tree.is_dirty(),
+                    s.in_progress_op.map(|o| o.label().to_string()),
+                    up.ahead,
+                    up.behind,
+                    up.is_diverged(),
+                )
+            }
+            None => (false, None, 0, 0, false),
+        };
 
     let role = resolve_workflow_role(&repo_path).await;
 
-    // A work item's MR targets develop; a hotfix's primary MR targets master.
-    let primary_target = if class == BranchClass::Hotfix { "master" } else { "develop" };
+    // A work item's MR targets develop; a hotfix's primary MR targets the
+    // production branch (main/master).
+    let primary_target = if class == BranchClass::Hotfix || class == BranchClass::Release {
+        resolve_production(&repo)?
+    } else {
+        "develop".to_string()
+    };
     let tracked_mr = work_item_log()
         .and_then(|log| log.mrs_for_branch(&repo_path, &branch).ok())
         .unwrap_or_default()
@@ -916,6 +964,8 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
         work_item,
         in_progress_op,
         dirty,
+        ahead,
+        behind,
         diverged,
         mr,
     });
@@ -928,9 +978,13 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
                 PrimaryAction::ResolveInWorkingDir => "resolve_in_working_dir",
                 PrimaryAction::ResolveMrConflict => "resolve_mr_conflict",
                 PrimaryAction::Commit => "commit",
+                PrimaryAction::Push => "push",
                 PrimaryAction::Finish => "finish",
                 PrimaryAction::FinishHotfix => "finish_hotfix",
+                PrimaryAction::FinishRelease => "finish_release",
+                PrimaryAction::SyncDevelop => "sync_develop",
                 PrimaryAction::ReturnToDevelop => "return_to_develop",
+                PrimaryAction::UpdateBranch => "update_branch",
                 PrimaryAction::StartWorkItem => "start_work_item",
             }
             .to_string()
@@ -944,6 +998,7 @@ fn classify_branch(name: &str) -> BranchClass {
         "develop" => BranchClass::Develop,
         "master" | "main" => BranchClass::Master,
         _ if name.starts_with("hotfix/") => BranchClass::Hotfix,
+        _ if name.starts_with("release/") => BranchClass::Release,
         _ if name.starts_with("feature/")
             || name.starts_with("bug/")
             || name.starts_with("chore/") =>
@@ -1033,9 +1088,14 @@ async fn build_status(repo_path: &str) -> Result<RepoStatus, String> {
 
     // Work Safe read-only state -- best-effort; a repo we can't inspect
     // (detached HEAD, unreadable) just reports the safe-looking default.
-    let ws = Repository::discover(repo_path)
-        .ok()
-        .and_then(|repo| git_core::read_repository_state(&repo).ok());
+    let repo_handle = Repository::discover(repo_path).ok();
+    let production_branch = repo_handle
+        .as_ref()
+        .and_then(git_core::production_branch)
+        .unwrap_or_else(|| "main".to_string());
+    let ws = repo_handle
+        .as_ref()
+        .and_then(|repo| git_core::read_repository_state(repo).ok());
     let (dirty, dirty_count, in_progress_op, ahead, behind, diverged) = match ws {
         Some(s) => {
             let up = s.upstream.unwrap_or_default();
@@ -1067,6 +1127,7 @@ async fn build_status(repo_path: &str) -> Result<RepoStatus, String> {
         ahead,
         behind,
         diverged,
+        production_branch,
     };
 
     Ok(status)
@@ -1482,7 +1543,7 @@ pub struct ContinueOutcome {
 /// this is the prefix itself; for hotfix it is `"hotfix"`.
 fn branch_work_type(branch: &str) -> Option<String> {
     match classify_branch(branch) {
-        BranchClass::WorkItem | BranchClass::Hotfix => {
+        BranchClass::WorkItem | BranchClass::Hotfix | BranchClass::Release => {
             branch.split('/').next().map(str::to_string)
         }
         _ => None,
@@ -1517,15 +1578,22 @@ async fn build_work_list(repo_path: &str) -> WorkList {
     let remote_url = repo.as_ref().and_then(|r| {
         r.find_remote("origin").ok().and_then(|rm| rm.url().map(str::to_string))
     });
+    let production = repo
+        .as_ref()
+        .and_then(git_core::production_branch)
+        .unwrap_or_else(|| "master".to_string());
     if let Some(client) = provider_client_for(&remote_url).await {
         let waiting: Vec<(String, String)> = wip_item_log()
             .and_then(|l| l.actionable(repo_path).ok())
             .unwrap_or_default()
             .into_iter()
             .filter(|i| i.status == "waiting")
+            // Release lifecycle (two MRs, supersede) is owned by
+            // `get_release_status`, not this single-MR reconcile.
+            .filter(|i| classify_branch(&i.branch) != BranchClass::Release)
             .filter_map(|i| {
                 let target = if classify_branch(&i.branch) == BranchClass::Hotfix {
-                    "master"
+                    production.as_str()
                 } else {
                     "develop"
                 };
@@ -1669,19 +1737,21 @@ pub struct InspectionOutcome {
 /// stash is re-applied so the tree is left exactly as it started. Never creates
 /// a branch, never resets, never discards.
 ///
-/// Pair with `end_branch_inspection`. Only `develop`/`master` are valid targets.
+/// Pair with `end_branch_inspection`. Only `develop` and the repo's production
+/// branch (`main`/`master`) are valid targets.
 #[tauri::command]
 pub async fn inspect_branch(
     app: AppHandle,
     repo_path: String,
     target: String,
 ) -> Result<InspectionOutcome, String> {
-    if target != "develop" && target != "master" {
+    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let production = resolve_production(&repo)?;
+    if target != "develop" && target != production {
         return Err(format!(
-            "branch inspection only supports 'develop' or 'master', not '{target}'"
+            "branch inspection only supports 'develop' or '{production}', not '{target}'"
         ));
     }
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
     let original_branch = current_branch(&repo)?;
     if original_branch == target {
         return Err(format!("already on '{target}' -- nothing to inspect"));
@@ -2277,6 +2347,450 @@ pub fn get_hotfix_version_preview(repo_path: String) -> Result<VersionPreview, S
     })
 }
 
+// --- Release workflow -------------------------------------------------------
+//
+// A Release Candidate is a one-shot immutable snapshot of `develop` submitted
+// for production review. The release branch carries only VERSION + CHANGELOG +
+// one prep commit -- never product code. Once `finish_release` opens the
+// `release/* -> production` MR the developer is done and is parked back on
+// `develop`; human review/merge runs in parallel and never blocks develop.
+// Multiple candidates may coexist on the provider: VC Flow tracks one current
+// candidate plus any number of `superseded` ones (wip_items.status).
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingCandidate {
+    pub branch: String,
+    pub version: String,
+    pub mr_iid: String,
+    pub merged: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleasePreview {
+    pub current_version: String,
+    pub commit_count: usize,
+    /// `"major"` | `"minor"` | `"patch"` -- Conventional Commit impact of the
+    /// range, defaulting to `"patch"` for an all-chore/empty range (still ships).
+    pub impact: String,
+    pub suggested_version: String,
+    /// Markdown lines to prefill the CHANGELOG textarea.
+    pub changelog_seed: Vec<String>,
+    pub pending_candidates: Vec<PendingCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SupersededCandidate {
+    pub version: String,
+    pub branch: String,
+    pub mr_iid: String,
+    pub web_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseStatusDto {
+    pub version: String,
+    pub candidate_branch: String,
+    pub production: Option<MrStatus>,
+    pub sync: Option<MrStatus>,
+    /// Production MR merged but no sync MR opened yet -> surface [Sync Develop].
+    pub sync_required: bool,
+    /// Both MRs merged.
+    pub complete: bool,
+    pub superseded: Vec<SupersededCandidate>,
+}
+
+/// `origin/<production>:VERSION` parsed, or `0.0.0` when the repo has never
+/// released (no remote production ref / no VERSION there yet). The current
+/// production version -- not local develop's, which may lag hotfixes.
+fn production_version(repo: &Repository, production: &str) -> git_core::Version {
+    git_core::read_file_at_ref(repo, &format!("refs/remotes/origin/{production}"), "VERSION")
+        .ok()
+        .and_then(|s| git_core::Version::parse(&s).ok())
+        .unwrap_or(git_core::Version { major: 0, minor: 0, patch: 0 })
+}
+
+fn release_range_refs(repo: &Repository, production: &str) -> (String, String) {
+    let prod = format!("refs/remotes/origin/{production}");
+    let prod = if repo.revparse_single(&prod).is_ok() { prod } else { production.to_string() };
+    let dev = "refs/remotes/origin/develop".to_string();
+    let dev = if repo.revparse_single(&dev).is_ok() { dev } else { "develop".to_string() };
+    (prod, dev)
+}
+
+/// `release/1.4.0-2` -> `"1.4.0"` (the `-N` supersede suffix is dropped).
+fn version_from_release_branch(branch: &str) -> String {
+    branch
+        .strip_prefix("release/")
+        .and_then(|r| r.split('-').next())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The production-target MR iid tracked for a release candidate branch.
+fn candidate_production_mr(repo_path: &str, branch: &str, production: &str) -> Option<String> {
+    work_item_log()?
+        .mrs_for_branch(repo_path, branch)
+        .ok()?
+        .into_iter()
+        .find(|m| m.target_branch == production)
+        .map(|m| m.mr_iid)
+}
+
+/// Read-only, NOT Owner-gated (D6): what `create_release_candidate` would do --
+/// the current production version, the Conventional Commit impact of
+/// `develop` since the last release, the suggested next version, a CHANGELOG
+/// seed, and any candidates already in flight.
+#[tauri::command]
+pub async fn get_release_preview(repo_path: String) -> Result<ReleasePreview, String> {
+    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let _ = git_core::fetch_origin(&repo);
+    let production = resolve_production(&repo)?;
+    let current = production_version(&repo, &production);
+
+    let (prod_ref, dev_ref) = release_range_refs(&repo, &production);
+    let commits =
+        git_core::commits_to_release(&repo, &prod_ref, &dev_ref).map_err(|e| e.to_string())?;
+    let bump = git_core::conventional_bump(&commits);
+    let suggested = git_core::suggest_version(&current, bump);
+
+    let remote_url =
+        repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+    let client = provider_client_for(&remote_url).await;
+
+    let mut pending = Vec::new();
+    for item in wip_item_log()
+        .and_then(|l| l.by_type(&repo_path, "release").ok())
+        .unwrap_or_default()
+    {
+        if !matches!(item.status.as_str(), "active" | "waiting") {
+            continue;
+        }
+        let Some(iid) = candidate_production_mr(&repo_path, &item.branch, &production) else {
+            continue;
+        };
+        let merged = match &client {
+            Some(c) => mr_snapshot(c, &iid).await.map(|m| m.merged).unwrap_or(false),
+            None => false,
+        };
+        pending.push(PendingCandidate {
+            version: version_from_release_branch(&item.branch),
+            branch: item.branch,
+            mr_iid: iid,
+            merged,
+        });
+    }
+
+    Ok(ReleasePreview {
+        current_version: current.to_string(),
+        commit_count: commits.len(),
+        impact: bump.as_str().to_string(),
+        suggested_version: suggested.to_string(),
+        changelog_seed: git_core::changelog_seed(&commits),
+        pending_candidates: pending,
+    })
+}
+
+/// Owner-only, step 1 of 2 (D2). Must run on `develop`. Fast-forwards develop,
+/// creates `release/<version>[-N]` (D4), writes VERSION + prepends CHANGELOG,
+/// and makes the single `chore: release <version>` prep commit -- then leaves
+/// the user on the release branch to review the diff before `finish_release`.
+///
+/// Errors (returned as prefixed strings the frontend classifies):
+/// - `SYNC_REQUIRED: ...`  a prior candidate's production MR already merged (D3)
+/// - `SUPERSEDE_REQUIRED: ...`  un-merged candidates exist and
+///   `supersede_confirmed` is false
+#[tauri::command]
+pub async fn create_release_candidate(
+    app: AppHandle,
+    repo_path: String,
+    version: String,
+    changelog_body: String,
+    supersede_confirmed: bool,
+) -> Result<RepoStatusWithPath, String> {
+    require_owner(&repo_path).await?;
+
+    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    if current_branch(&repo)? != "develop" {
+        return Err("release candidates are prepared from develop -- switch to develop first".into());
+    }
+    let production = resolve_production(&repo)?;
+
+    guard_working_tree(&repo_path, &mut repo, "preparing a release candidate")?;
+
+    let _ = git_core::fetch_origin(&repo);
+    run_git(&repo_path, "fast_forward", "develop", || {
+        git_core::fast_forward_from_origin(&repo, "develop")
+    })
+    .map_err(|e| e.to_string())?;
+
+    let current = production_version(&repo, &production);
+    let new_v = git_core::Version::parse(&version).map_err(|e| e.to_string())?;
+    if new_v <= current {
+        return Err(format!(
+            "version {new_v} must be greater than the current production version {current}"
+        ));
+    }
+
+    let pending: Vec<auth_core::WipItem> = wip_item_log()
+        .and_then(|l| l.by_type(&repo_path, "release").ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| matches!(i.status.as_str(), "active" | "waiting"))
+        .collect();
+
+    if !pending.is_empty() {
+        let remote_url =
+            repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+        if let Some(client) = provider_client_for(&remote_url).await {
+            for item in &pending {
+                let Some(iid) = candidate_production_mr(&repo_path, &item.branch, &production)
+                else {
+                    continue;
+                };
+                if mr_snapshot(&client, &iid).await.map(|m| m.merged).unwrap_or(false) {
+                    return Err(format!(
+                        "SYNC_REQUIRED: release candidate {} has already merged to {production} \
+                         (MR {iid}). Sync develop before preparing another release.",
+                        item.branch
+                    ));
+                }
+            }
+        }
+        if !supersede_confirmed {
+            let names: Vec<&str> = pending.iter().map(|i| i.branch.as_str()).collect();
+            return Err(format!(
+                "SUPERSEDE_REQUIRED: {} pending release candidate(s) will be superseded: {}",
+                pending.len(),
+                names.join(", ")
+            ));
+        }
+    }
+
+    let mut name = format!("release/{new_v}");
+    let mut n = 2;
+    while git_core::ref_exists(&repo, &name) {
+        name = format!("release/{new_v}-{n}");
+        n += 1;
+    }
+
+    run_git(&repo_path, "create_release_branch", &name, || {
+        git_core::create_release_branch(&repo, &name, "develop")
+    })
+    .map_err(|e| e.to_string())?;
+
+    let workdir = repo
+        .workdir()
+        .ok_or("repository has no working directory")?
+        .to_path_buf();
+    git_core::write_version_file(&workdir, &new_v).map_err(|e| e.to_string())?;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    git_core::prepend_section(&workdir, &new_v, &today, &changelog_body).map_err(|e| e.to_string())?;
+
+    let msg = format!("chore: release {new_v}");
+    run_git(&repo_path, "commit", &msg, || git_core::commit_all(&repo, &msg))
+        .map_err(|e| e.to_string())?;
+
+    if let Some(log) = wip_item_log() {
+        log.start(&repo_path, &name, "release").ok();
+        for item in &pending {
+            log.set_status(&repo_path, &item.branch, "superseded").ok();
+        }
+    }
+    audit_best_effort(&repo_path, "create_release_candidate", &name, None);
+
+    let status = build_and_emit_status(&app, &repo_path).await?;
+    Ok(RepoStatusWithPath { status, repo_path })
+}
+
+/// Owner-only, step 2 of 2 (D2). Pushes the release branch and opens the single
+/// `release/* -> production` MR, then parks the user back on `develop`. The
+/// `production -> develop` sync is a separate action once a candidate merges
+/// (`sync_develop_after_release`).
+#[tauri::command]
+pub async fn finish_release(
+    app: AppHandle,
+    repo_path: String,
+    title: String,
+) -> Result<RepoStatusWithPath, String> {
+    require_owner(&repo_path).await?;
+
+    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let branch = current_branch(&repo)?;
+    if classify_branch(&branch) != BranchClass::Release {
+        return Err("finish_release must run on a release/* branch".into());
+    }
+    let production = resolve_production(&repo)?;
+
+    run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch))
+        .map_err(|e| e.to_string())?;
+
+    let remote_url =
+        repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+    let client = provider_client_for(&remote_url)
+        .await
+        .ok_or("could not reach the provider API for this remote (check token/host)")?;
+    let mr = client
+        .create_merge_request(&branch, &production, &title)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(log) = work_item_log() {
+        log.add_mr(&repo_path, &branch, &production, &mr.id).ok();
+    }
+    if let Some(log) = wip_item_log() {
+        log.set_status(&repo_path, &branch, "waiting").ok();
+    }
+    audit_best_effort(&repo_path, "finish_release", &branch, Some(&mr.id));
+
+    // Developer side done -- park back on develop. Best-effort (see finish_hotfix).
+    let _ = run_git(&repo_path, "checkout", "develop", || {
+        git_core::checkout_branch(&repo, "develop")
+    });
+
+    let status = build_and_emit_status(&app, &repo_path).await?;
+    Ok(RepoStatusWithPath { status, repo_path })
+}
+
+/// Owner-only: opens the `production -> develop` sync MR for a merged release
+/// candidate. Surfaced by the Active Release panel only after that candidate's
+/// production MR has actually merged (D3 remediation path too).
+#[tauri::command]
+pub async fn sync_develop_after_release(
+    app: AppHandle,
+    repo_path: String,
+    candidate_branch: String,
+    title: String,
+) -> Result<RepoStatus, String> {
+    require_owner(&repo_path).await?;
+
+    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let production = resolve_production(&repo)?;
+
+    let remote_url =
+        repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+    let client = provider_client_for(&remote_url)
+        .await
+        .ok_or("could not reach the provider API for this remote (check token/host)")?;
+    let mr = client
+        .create_merge_request(&production, "develop", &format!("sync: {title}"))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(log) = work_item_log() {
+        log.add_mr(&repo_path, &candidate_branch, "develop", &mr.id).ok();
+    }
+    audit_best_effort(&repo_path, "sync_develop_after_release", &candidate_branch, Some(&mr.id));
+
+    build_and_emit_status(&app, &repo_path).await
+}
+
+/// Read-only: the current release candidate's two MRs plus any superseded
+/// candidates. `None` when no release candidate is tracked for this repo.
+#[tauri::command]
+pub async fn get_release_status(repo_path: String) -> Result<Option<ReleaseStatusDto>, String> {
+    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let production = resolve_production(&repo)?;
+
+    let all = wip_item_log()
+        .and_then(|l| l.by_type(&repo_path, "release").ok())
+        .unwrap_or_default();
+    let Some(current) = all
+        .iter()
+        .find(|i| matches!(i.status.as_str(), "active" | "waiting"))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+
+    let remote_url =
+        repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+    let client = provider_client_for(&remote_url).await;
+
+    let mrs = work_item_log()
+        .and_then(|l| l.mrs_for_branch(&repo_path, &current.branch).ok())
+        .unwrap_or_default();
+    let prod_iid = mrs.iter().find(|m| m.target_branch == production).map(|m| m.mr_iid.clone());
+    let sync_iid = mrs.iter().find(|m| m.target_branch == "develop").map(|m| m.mr_iid.clone());
+
+    let mut prod_status = None;
+    let mut sync_status = None;
+    if let Some(c) = &client {
+        if let Some(i) = &prod_iid {
+            prod_status = fetch_mr_status(c, i).await.ok();
+        }
+        if let Some(i) = &sync_iid {
+            sync_status = fetch_mr_status(c, i).await.ok();
+        }
+    }
+
+    let prod_merged = prod_status.as_ref().map(|s| s.status == "Merged").unwrap_or(false);
+    let sync_merged = sync_status.as_ref().map(|s| s.status == "Merged").unwrap_or(false);
+    let sync_required = prod_merged && sync_iid.is_none();
+    let complete = prod_merged && sync_merged;
+
+    if complete {
+        if let Some(log) = wip_item_log() {
+            log.set_status(&repo_path, &current.branch, "completed").ok();
+        }
+    }
+
+    let mut superseded = Vec::new();
+    for item in all.iter().filter(|i| i.status == "superseded") {
+        let Some(iid) = candidate_production_mr(&repo_path, &item.branch, &production) else {
+            continue;
+        };
+        let web_url = match &client {
+            Some(c) => fetch_mr_status(c, &iid).await.ok().map(|s| s.web_url),
+            None => None,
+        };
+        superseded.push(SupersededCandidate {
+            version: version_from_release_branch(&item.branch),
+            branch: item.branch.clone(),
+            mr_iid: iid,
+            web_url,
+        });
+    }
+
+    Ok(Some(ReleaseStatusDto {
+        version: version_from_release_branch(&current.branch),
+        candidate_branch: current.branch,
+        production: prod_status,
+        sync: sync_status,
+        sync_required,
+        complete,
+        superseded,
+    }))
+}
+
+/// Fast-forward `develop` or the production branch to `origin/<branch>`.
+/// Refuses on any other branch, a dirty tree, or a real divergence -- it is a
+/// plain pull that never touches uncommitted work (Work Safe). Surfaced as the
+/// next action whenever HEAD sits on a stale develop/production.
+#[tauri::command]
+pub async fn update_branch(app: AppHandle, repo_path: String) -> Result<RepoStatus, String> {
+    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    let branch = current_branch(&repo)?;
+    let production = resolve_production(&repo).ok();
+    if branch != "develop" && production.as_deref() != Some(branch.as_str()) {
+        return Err("update is only for develop or the production branch".into());
+    }
+    if git_core::read_repository_state(&repo)
+        .map_err(|e| e.to_string())?
+        .working_tree
+        .is_dirty()
+    {
+        return Err("commit or save your work first -- update does a plain fast-forward".into());
+    }
+
+    let _ = git_core::fetch_origin(&repo);
+    run_git(&repo_path, "fast_forward", &branch, || {
+        git_core::fast_forward_from_origin(&repo, &branch)
+    })
+    .map_err(|e| e.to_string())?;
+    audit_best_effort(&repo_path, "update_branch", &branch, None);
+    build_and_emit_status(&app, &repo_path).await
+}
+
 /// UI integration (not workflow logic): open the repo's working directory in
 /// the OS file manager.
 #[tauri::command]
@@ -2523,6 +3037,37 @@ mod tests {
         let s = get_setup_state(dir.path().to_str().unwrap().to_string()).await.unwrap();
         assert_eq!(s.phase, "preflight_failed");
         assert_eq!(s.checks.len(), 7);
+    }
+
+    #[test]
+    fn release_branch_classification_and_version_parsing() {
+        assert_eq!(classify_branch("release/1.4.0"), BranchClass::Release);
+        assert_eq!(classify_branch("release/1.4.0-2"), BranchClass::Release);
+        assert_eq!(branch_work_type("release/1.4.0-3").as_deref(), Some("release"));
+        assert_eq!(version_from_release_branch("release/1.4.0"), "1.4.0");
+        assert_eq!(version_from_release_branch("release/1.4.0-2"), "1.4.0");
+        assert_eq!(version_from_release_branch("release/2.0.0-5"), "2.0.0");
+    }
+
+    #[test]
+    fn release_branch_name_picks_free_dash_n_suffix() {
+        let dir = tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "develop"]);
+        git(dir.path(), &["config", "user.email", "t@e.com"]);
+        git(dir.path(), &["config", "user.name", "T"]);
+        std::fs::write(dir.path().join("VERSION"), "1.3.0\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-m", "init"]);
+        git(dir.path(), &["branch", "release/1.4.0"]);
+
+        let repo = Repository::open(dir.path()).unwrap();
+        let mut name = "release/1.4.0".to_string();
+        let mut n = 2;
+        while git_core::ref_exists(&repo, &name) {
+            name = format!("release/1.4.0-{n}");
+            n += 1;
+        }
+        assert_eq!(name, "release/1.4.0-2");
     }
 
     #[test]

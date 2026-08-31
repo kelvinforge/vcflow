@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react"
+import { useEffect, useState, type ReactNode } from "react"
 import { FolderOpen, RefreshCw } from "lucide-react"
-import { openWorkingDirectory, type RepoStatus } from "@/lib/tauri"
+import { pickRepo, type RepoStatus } from "@/lib/tauri"
 import { loadRecentRepos, rememberRepo } from "@/lib/repo"
-import { Badge, Button, Input } from "@/components/ui"
+import { Button } from "@/components/ui"
 import { TokenButton } from "@/components/TokenButton"
+import { cn } from "@/lib/utils"
 
 function ago(ts: number | null): string {
   if (!ts) return "never"
@@ -11,6 +12,29 @@ function ago(ts: number | null): string {
   if (s < 5) return "just now"
   if (s < 60) return `${s}s ago`
   return `${Math.round(s / 60)}m ago`
+}
+
+function health(status: RepoStatus): { dot: string; label: string } {
+  if (!status.ssh_ok) return { dot: "bg-destructive", label: "SSH unreachable" }
+  if (!status.gitlab_ok)
+    return { dot: "bg-destructive/60", label: `${status.provider} not authenticated` }
+  return { dot: "bg-primary", label: "connected" }
+}
+
+/** Connection health dot + label. Lives in the footer. */
+export function RepoHealth({ status }: { status: RepoStatus | null }) {
+  if (!status) return null
+  const h = health(status)
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span className={cn("h-1.5 w-1.5 rounded-full", h.dot)} />
+      {h.label}
+    </span>
+  )
+}
+
+function Dot({ children }: { children: ReactNode }) {
+  return <span className="text-border">{children}</span>
 }
 
 export function RepoHeader({
@@ -29,7 +53,6 @@ export function RepoHeader({
   onRefresh: () => void
 }) {
   // Parent passes key={repoPath}, so this mounts fresh per repo -- no prop sync.
-  const [input, setInput] = useState(repoPath)
   const [recents, setRecents] = useState<string[]>(loadRecentRepos)
   const [, tick] = useState(0)
 
@@ -45,84 +68,68 @@ export function RepoHeader({
     onOpenRepo(t)
   }
 
-  return (
-    <div className="flex flex-col gap-3 rounded-lg border border-border bg-card p-4">
-      <p className="text-xs font-medium text-foreground">Repository</p>
+  const browse = async () => {
+    const picked = await pickRepo()
+    if (picked) open(picked)
+  }
 
-      <div className="flex gap-2">
-        <Input
-          className="flex-1"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && open(input)}
-          placeholder="/path/to/repo"
-        />
-        <Button variant="primary" disabled={!input.trim()} onClick={() => open(input)}>
-          Open
-        </Button>
-        <Button onClick={() => openWorkingDirectory(repoPath)} title="Open in file manager">
-          <FolderOpen size={14} />
+  return (
+    <div className="flex flex-col gap-2">
+      {/* Row 1: current repo + controls */}
+      <div className="flex items-center gap-2">
+        <FolderOpen size={16} className="shrink-0 text-muted-foreground" />
+        <span
+          className="min-w-0 flex-1 truncate text-base font-semibold text-foreground"
+          title={repoPath}
+        >
+          {repoPath.split("/").filter(Boolean).pop() || repoPath || "No repository"}
+        </span>
+        <select
+          className="w-40 shrink-0 rounded border border-border bg-transparent px-2 py-1 text-xs"
+          value=""
+          onChange={(e) => {
+            const v = e.target.value
+            if (v === "__browse__") void browse()
+            else if (v) open(v)
+          }}
+        >
+          <option value="">Open / switch repo…</option>
+          <option value="__browse__">Browse folder…</option>
+          {recents.map((r) => (
+            <option key={r} value={r}>
+              {r.split("/").filter(Boolean).pop() || r}
+            </option>
+          ))}
+        </select>
+        <Button onClick={onRefresh} disabled={refreshing} title="Refresh status">
+          <RefreshCw size={14} className={refreshing ? "animate-spin" : ""} />
         </Button>
       </div>
 
-      {!status && (
+      {/* Row 2: status (left) + health (right) */}
+      {!status ? (
         <p className="text-xs text-muted-foreground">
-          Enter a local repository path or choose a recent repository.
+          Choose a repository folder, or pick a recent one.
         </p>
-      )}
-
-      {recents.length > 0 && (
-        <label className="flex items-center gap-2 text-xs text-muted-foreground">
-          Recent repositories:
-          <select
-            className="flex-1 rounded border border-border bg-transparent px-2 py-1"
-            value=""
-            onChange={(e) => e.target.value && open(e.target.value)}
-          >
-            <option value="">Choose…</option>
-            {recents.map((r) => (
-              <option key={r} value={r}>
-                {r.split("/").filter(Boolean).pop() || r}
-              </option>
-            ))}
-          </select>
-        </label>
-      )}
-
-      {status && (
-        <>
-          <p className="text-xs font-medium text-foreground">Status</p>
-          <div className="flex flex-wrap items-center gap-2 text-xs">
-            <Badge>{status.provider}</Badge>
-            <Badge tone="ok">{status.branch}</Badge>
-            {status.version && <Badge>v{status.version}</Badge>}
+      ) : (
+        <div className="flex items-center justify-between gap-4 text-xs text-muted-foreground">
+          <div className="flex min-w-0 items-center gap-2 truncate">
+            <span>{status.provider}</span>
+            <Dot>·</Dot>
+            <span className="font-medium text-foreground">{status.branch}</span>
+            {status.version && (
+              <>
+                <Dot>·</Dot>
+                <span>v{status.version}</span>
+              </>
+            )}
           </div>
-          <div className="flex flex-wrap items-center gap-2 text-xs">
-            <Badge tone={status.ssh_ok ? "ok" : "bad"}>
-              SSH {status.ssh_ok ? "connected" : "unreachable"}
-            </Badge>
-            <Badge tone={status.gitlab_ok ? "ok" : "warn"}>
-              GitLab {status.gitlab_ok ? "authenticated" : "unauthenticated"}
-            </Badge>
-            <Badge tone={status.role === "Owner" ? "ok" : "muted"}>{status.role}</Badge>
-          </div>
-
-          <div className="border-t border-border pt-2">
-            <p className="mb-1 text-xs font-medium text-foreground">Connection</p>
+          <div className="flex shrink-0 items-center gap-2">
             <TokenButton repoPath={repoPath} status={status} onChanged={onRefresh} />
+            <Dot>·</Dot>
+            <span title="Last refreshed">{ago(lastRefreshed)}</span>
           </div>
-
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span>Refreshed {ago(lastRefreshed)}</span>
-            <button
-              className="inline-flex items-center gap-1 hover:text-foreground"
-              onClick={onRefresh}
-              disabled={refreshing}
-            >
-              <RefreshCw size={12} className={refreshing ? "animate-spin" : ""} /> Refresh
-            </button>
-          </div>
-        </>
+        </div>
       )}
     </div>
   )

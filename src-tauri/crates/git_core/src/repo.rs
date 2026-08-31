@@ -68,6 +68,29 @@ pub fn production_branch(repo: &Repository) -> Option<String> {
     None
 }
 
+/// Reads `path` (repo-relative, e.g. `"VERSION"`) as it exists at `ref_name`
+/// (e.g. `"refs/remotes/origin/master"`) without touching the working tree.
+/// `Err` when the ref or the file is absent at that ref.
+pub fn read_file_at_ref(
+    repo: &Repository,
+    ref_name: &str,
+    path: &str,
+) -> Result<String, RepoError> {
+    let tree = repo.revparse_single(ref_name)?.peel_to_tree()?;
+    let entry = tree.get_path(Path::new(path))?;
+    let blob = repo.find_blob(entry.id())?;
+    Ok(String::from_utf8_lossy(blob.content()).into_owned())
+}
+
+/// True when `name` resolves to a local branch head or to
+/// `refs/remotes/origin/<name>`. Used to pick a free `release/x.y.z[-N]` name.
+pub fn ref_exists(repo: &Repository, name: &str) -> bool {
+    repo.find_branch(name, git2::BranchType::Local).is_ok()
+        || repo
+            .revparse_single(&format!("refs/remotes/origin/{name}"))
+            .is_ok()
+}
+
 fn unborn_branch_name(repo: &Repository) -> String {
     repo.find_reference("HEAD")
         .ok()
