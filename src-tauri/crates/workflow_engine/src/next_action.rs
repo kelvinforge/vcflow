@@ -124,26 +124,22 @@ pub fn next_action(s: &WorkflowSnapshot) -> NextAction {
     if s.dirty && matches!(s.branch, BranchClass::Master | BranchClass::Develop) {
         let (title, description) = if s.branch == BranchClass::Master {
             (
-                "Changes on the production branch",
-                "You have uncommitted changes on the production branch. Direct development on \
-                 production is not allowed. Create a feature branch and keep your changes there.",
+                "Production branch is protected",
+                "You can't commit or push on the production branch. Move your changes to a feature \
+                 branch and keep working there.",
             )
         } else {
             (
-                "Direct Changes on develop",
-                "You have uncommitted changes on develop. Development should normally happen on a \
-                 feature branch and reach develop through a merge request. Move your changes onto \
-                 a feature branch now.",
+                "develop is protected",
+                "You can't commit or push on develop. Move your changes to a feature branch and \
+                 keep working there.",
             )
         };
         return NextAction {
             title: title.into(),
             description: description.into(),
             primary: Some(PrimaryAction::MoveToNewBranch),
-            helper: Some(
-                "Your changes are saved and re-applied onto the new branch -- nothing is discarded."
-                    .into(),
-            ),
+            helper: Some("Your changes move with you — nothing is lost.".into()),
         };
     }
 
@@ -332,7 +328,7 @@ mod tests {
         };
         let a = next_action(&s);
         assert_eq!(a.primary, Some(PrimaryAction::MoveToNewBranch));
-        assert_eq!(a.title, "Changes on the production branch");
+        assert_eq!(a.title, "Production branch is protected");
     }
 
     #[test]
@@ -345,7 +341,7 @@ mod tests {
         };
         let a = next_action(&s);
         assert_eq!(a.primary, Some(PrimaryAction::MoveToNewBranch));
-        assert_eq!(a.title, "Direct Changes on develop");
+        assert_eq!(a.title, "develop is protected");
     }
 
     #[test]

@@ -117,9 +117,12 @@ export function RepoHeader({
             <span>{status.provider}</span>
             <Dot>·</Dot>
             <span className="font-medium text-foreground">{status.branch}</span>
-            {status.branch_protected && (
-              <Badge tone="warn" title="Protected branch — commits and pushes are blocked by the Workflow Guard">
-                Protected
+            {status.branch_guard && (
+              <Badge
+                tone={status.branch_guard === "block" ? "bad" : "warn"}
+                title="Protected branch — commits and pushes are blocked by the Workflow Guard"
+              >
+                ⚠ Protected
               </Badge>
             )}
             {status.version && (

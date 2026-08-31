@@ -58,11 +58,12 @@ pub struct RepoStatus {
     /// of assuming `master`.
     pub production_branch: String,
 
-    /// The current branch is protected (`main`/`master`/`develop`) -- the
-    /// Workflow Guard covers it. Purely a UI hint (the "Protected" badge); the
-    /// actual commit/push blocking is enforced in the command layer. Derived
-    /// from `classify_branch`, never a separate hard-coded list.
-    pub branch_protected: bool,
+    /// Workflow Guard severity for the current branch, derived from
+    /// `classify_branch` (never a separate list): `"block"` for
+    /// `main`/`master`, `"warn"` for `develop`, `None` for a normal working
+    /// branch. UI hint only (badge + guard-card intensity); the actual
+    /// commit/push blocking is enforced in the command layer.
+    pub branch_guard: Option<String>,
 }
 
 /// Resolve the repo's production branch (`main`/`master`), erroring when the
@@ -1141,10 +1142,21 @@ fn classify_branch(name: &str) -> BranchClass {
     }
 }
 
+/// Workflow Guard severity for `name`, from `classify_branch` (never a
+/// separate list): `"block"` for production, `"warn"` for develop, `None`
+/// otherwise.
+fn branch_guard(name: &str) -> Option<&'static str> {
+    match classify_branch(name) {
+        BranchClass::Master => Some("block"),
+        BranchClass::Develop => Some("warn"),
+        _ => None,
+    }
+}
+
 /// A protected development branch the Workflow Guard covers -- no direct
 /// commits or pushes. Reuses `classify_branch`; never a separate branch list.
 fn branch_is_protected(name: &str) -> bool {
-    matches!(classify_branch(name), BranchClass::Develop | BranchClass::Master)
+    branch_guard(name).is_some()
 }
 
 /// Workflow Guard enforcement: refuse a mutating git op on a protected branch.
@@ -1264,7 +1276,7 @@ async fn build_status(repo_path: &str) -> Result<RepoStatus, String> {
         None => (false, 0, None, 0, 0, false),
     };
 
-    let branch_protected = branch_is_protected(&info.current_branch);
+    let branch_guard = branch_guard(&info.current_branch).map(str::to_string);
     let status = RepoStatus {
         branch: info.current_branch,
         version: info.version,
@@ -1282,7 +1294,7 @@ async fn build_status(repo_path: &str) -> Result<RepoStatus, String> {
         behind,
         diverged,
         production_branch,
-        branch_protected,
+        branch_guard,
     };
 
     Ok(status)
