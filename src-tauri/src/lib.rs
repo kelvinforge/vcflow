@@ -23,6 +23,7 @@ pub fn run() {
       commands::get_setup_state,
       commands::save_token,
       commands::create_work_item,
+      commands::move_changes_to_new_branch,
       commands::commit_work_item,
       commands::push_work_item,
       commands::finish_work_item,

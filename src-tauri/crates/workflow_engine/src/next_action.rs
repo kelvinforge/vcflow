@@ -83,6 +83,10 @@ pub enum PrimaryAction {
     /// pure pull that never touches uncommitted work.
     UpdateBranch,
     StartWorkItem,
+    /// Workflow Guard: uncommitted changes on a protected branch
+    /// (`main`/`master`/`develop`). Stash the changes, branch off `develop`,
+    /// and re-apply them there. (Work Safe -- nothing is discarded.)
+    MoveToNewBranch,
 }
 
 /// Pure decision: given the observed state, the one recommended next step.
@@ -109,6 +113,33 @@ pub fn next_action(s: &WorkflowSnapshot) -> NextAction {
                 .into(),
             primary: Some(PrimaryAction::ResolveInWorkingDir),
             helper: None,
+        };
+    }
+
+    // Workflow Guard: uncommitted changes on a protected branch. `main`/`master`
+    // is a hard "not allowed"; `develop` is a warning. Both route to the same
+    // one-click recovery (stash -> branch off develop -> re-apply). The
+    // command-layer guards in the Tauri layer are what actually block the
+    // commit/push -- this is the explain-and-recover surface.
+    if s.dirty && matches!(s.branch, BranchClass::Master | BranchClass::Develop) {
+        let (title, description) = if s.branch == BranchClass::Master {
+            (
+                "Production branch is protected",
+                "You can't commit or push on the production branch. Move your changes to a feature \
+                 branch and keep working there.",
+            )
+        } else {
+            (
+                "develop is protected",
+                "You can't commit or push on develop. Move your changes to a feature branch and \
+                 keep working there.",
+            )
+        };
+        return NextAction {
+            title: title.into(),
+            description: description.into(),
+            primary: Some(PrimaryAction::MoveToNewBranch),
+            helper: Some("Your changes move with you — nothing is lost.".into()),
         };
     }
 
@@ -288,6 +319,49 @@ mod tests {
     }
 
     #[test]
+    fn workflow_guard_blocks_dirty_production() {
+        let s = WorkflowSnapshot {
+            branch: BranchClass::Master,
+            work_item: WorkItemState::NotStarted,
+            dirty: true,
+            ..base()
+        };
+        let a = next_action(&s);
+        assert_eq!(a.primary, Some(PrimaryAction::MoveToNewBranch));
+        assert_eq!(a.title, "Production branch is protected");
+    }
+
+    #[test]
+    fn workflow_guard_warns_dirty_develop() {
+        let s = WorkflowSnapshot {
+            branch: BranchClass::Develop,
+            work_item: WorkItemState::NotStarted,
+            dirty: true,
+            ..base()
+        };
+        let a = next_action(&s);
+        assert_eq!(a.primary, Some(PrimaryAction::MoveToNewBranch));
+        assert_eq!(a.title, "develop is protected");
+    }
+
+    #[test]
+    fn workflow_guard_ignores_clean_protected_branch() {
+        let s = WorkflowSnapshot {
+            branch: BranchClass::Master,
+            work_item: WorkItemState::NotStarted,
+            dirty: false,
+            ..base()
+        };
+        assert_ne!(next_action(&s).primary, Some(PrimaryAction::MoveToNewBranch));
+    }
+
+    #[test]
+    fn workflow_guard_does_not_touch_feature_branches() {
+        let s = WorkflowSnapshot { branch: BranchClass::WorkItem, dirty: true, ..base() };
+        assert_eq!(next_action(&s).primary, Some(PrimaryAction::Commit));
+    }
+
+    #[test]
     fn in_progress_op_beats_everything() {
         let s = WorkflowSnapshot {
             in_progress_op: Some("rebase".into()),
@@ -433,9 +507,12 @@ mod tests {
 
     #[test]
     fn not_started_offers_start_and_notes_autosave_when_dirty() {
+        // On a non-protected branch the dirty-tree autosave note still shows.
+        // (Dirty on develop/master is intercepted by the Workflow Guard -- see
+        // the `workflow_guard_*` tests.)
         let s = WorkflowSnapshot {
             work_item: WorkItemState::NotStarted,
-            branch: BranchClass::Develop,
+            branch: BranchClass::Other,
             dirty: true,
             ..base()
         };

@@ -78,6 +78,7 @@ export function ExistingWorkflow({ wf }: { wf: WorkflowState }) {
         <NextActionCard
           repoPath={wf.repoPath}
           nextAction={wf.nextAction}
+          status={wf.status}
           loading={wf.status === null}
           onRun={onRun}
         />

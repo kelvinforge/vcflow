@@ -18,7 +18,7 @@ mod status;
 mod sync;
 mod version;
 
-pub use branch::{checkout_branch, create_work_branch, BranchError, BranchKind};
+pub use branch::{checkout_branch, create_work_branch, slugify, BranchError, BranchKind};
 pub use changelog::prepend_section;
 pub use commit_push::{commit_all, commit_merge, push, CommitPushError};
 pub use conflict_verify::{verify_resolved, Issue, VerifyError};
