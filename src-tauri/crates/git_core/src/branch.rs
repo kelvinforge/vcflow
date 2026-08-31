@@ -26,9 +26,30 @@ impl BranchKind {
     }
 }
 
+/// Normalise any free text into a branch slug: lowercase, every run of
+/// non-alphanumeric characters collapsed to a single `-`, leading/trailing
+/// `-` trimmed. `"Hi, how are you?"` -> `"hi-how-are-you"`. An empty result
+/// (input had no letters or digits) is the caller's problem to reject.
+pub fn slugify(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_dash = false;
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(c.to_ascii_lowercase());
+        } else {
+            pending_dash = true;
+        }
+    }
+    out
+}
+
 #[derive(Debug, Error)]
 pub enum BranchError {
-    #[error("slug must be lowercase letters, digits, and hyphens only, got: {0}")]
+    #[error("'{0}' has no letters or digits to build a branch name from")]
     InvalidSlug(String),
     #[error("base branch '{0}' not found locally")]
     BaseNotFound(String),
@@ -64,13 +85,11 @@ pub fn create_work_branch(
     slug: &str,
     base: &str,
 ) -> Result<String, BranchError> {
-    let valid_slug = !slug.is_empty()
-        && slug
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if !valid_slug {
+    let clean = slugify(slug);
+    if clean.is_empty() {
         return Err(BranchError::InvalidSlug(slug.to_string()));
     }
+    let slug = clean;
 
     let branch_name = format!("{}/{slug}", kind.prefix());
     if repo.find_branch(&branch_name, BranchType::Local).is_ok() {
@@ -139,11 +158,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_uppercase_slug() {
+    fn slugify_normalises_free_text() {
+        assert_eq!(slugify("MyThing"), "mything");
+        assert_eq!(slugify("Hi, how are you?"), "hi-how-are-you");
+        assert_eq!(slugify("  leading/trailing  "), "leading-trailing");
+        assert_eq!(slugify("multi___dash---run"), "multi-dash-run");
+        assert_eq!(slugify("Fix bug #42 (urgent)"), "fix-bug-42-urgent");
+        assert_eq!(slugify("non-ascii café dropped"), "non-ascii-caf-dropped");
+        assert_eq!(slugify("!!!"), "");
+    }
+
+    #[test]
+    fn create_work_branch_slugifies_the_name() {
         let dir = init_repo_with_develop();
         let repo = Repository::open(dir.path()).unwrap();
 
-        let err = create_work_branch(&repo, BranchKind::Feature, "MyThing", "develop").unwrap_err();
+        let name =
+            create_work_branch(&repo, BranchKind::Feature, "Hi, how are you?", "develop").unwrap();
+        assert_eq!(name, "feature/hi-how-are-you");
+        assert_eq!(repo.head().unwrap().shorthand(), Some("feature/hi-how-are-you"));
+    }
+
+    #[test]
+    fn rejects_slug_with_no_alphanumerics() {
+        let dir = init_repo_with_develop();
+        let repo = Repository::open(dir.path()).unwrap();
+
+        let err = create_work_branch(&repo, BranchKind::Feature, "  ...  ", "develop").unwrap_err();
         assert!(matches!(err, BranchError::InvalidSlug(_)));
     }
 

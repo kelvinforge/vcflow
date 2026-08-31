@@ -11,6 +11,7 @@ import {
   type WorkItemKind,
 } from "@/lib/tauri"
 import { Button, Card, ErrorLine, Input, Textarea } from "@/components/ui"
+import { slugify } from "@/lib/utils"
 
 type Mode = "choose" | "work" | "hotfix" | "release"
 
@@ -140,9 +141,9 @@ function WorkForm({
             className="flex-1"
             autoFocus
             value={slug}
-            onChange={(e) => setSlug(e.target.value)}
+            onChange={(e) => setSlug(slugify(e.target.value))}
             onKeyDown={(e) => e.key === "Enter" && slug.trim() && create()}
-            placeholder="branch name (lowercase-hyphens)"
+            placeholder="branch name — any text, we clean it up"
           />
         </div>
         <p className="text-xs text-muted-foreground">
@@ -214,9 +215,9 @@ function HotfixForm({
         <Input
           autoFocus
           value={slug}
-          onChange={(e) => setSlug(e.target.value)}
+          onChange={(e) => setSlug(slugify(e.target.value))}
           onKeyDown={(e) => e.key === "Enter" && slug.trim() && create()}
-          placeholder="branch name (lowercase-hyphens)"
+          placeholder="branch name — any text, we clean it up"
         />
         <p className="text-xs text-muted-foreground">
           Branch: <code>hotfix/{slug.trim() || "…"}</code>

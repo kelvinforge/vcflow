@@ -1,23 +1,27 @@
 import { useState } from "react"
+import { ArrowRight, Lock, TriangleAlert } from "lucide-react"
 import { ACTIONS, type FieldName } from "@/lib/actions"
-import type { NextActionDto, WorkItemKind } from "@/lib/tauri"
+import type { NextActionDto, RepoStatus, WorkItemKind } from "@/lib/tauri"
 import { Button, Card, ErrorLine, Input, Textarea } from "@/components/ui"
+import { cn, slugify } from "@/lib/utils"
 
 const FIELD_PLACEHOLDER: Record<FieldName, string> = {
   message: "commit message",
   title: "merge request title",
   kind: "",
-  slug: "branch slug (lowercase-hyphens)",
+  slug: "branch name — any text, we clean it up",
 }
 
 export function NextActionCard({
   repoPath,
   nextAction,
+  status,
   loading,
   onRun,
 }: {
   repoPath: string
   nextAction: NextActionDto | null
+  status: RepoStatus | null
   /** true until the first repo status has loaded. */
   loading: boolean
   /** Runs the action's command, then refreshes. Returns error string or null. */
@@ -57,16 +61,42 @@ export function NextActionCard({
     if (!err) setValues({})
   }
 
+  // Workflow Guard card: uncommitted changes on a protected branch. `block`
+  // (main/master) is louder than `warn` (develop). The theme only ships a
+  // destructive colour, so severity is expressed by intensity, not hue.
+  const guard = nextAction.primary === "move_to_new_branch"
+  const block = status?.branch_guard === "block"
+  const guardBorder = block
+    ? "border-destructive bg-destructive/10"
+    : "border-destructive/40 bg-destructive/5"
+
   return (
-    <Card className="border-primary/30">
+    <Card className={cn(guard ? guardBorder : "border-primary/30")}>
       <div className="flex flex-col gap-3">
-        <div className="flex flex-col gap-1">
-          <p className="text-base font-semibold text-foreground">{nextAction.title}</p>
-          <p className="text-sm text-muted-foreground">{nextAction.description}</p>
-          {nextAction.helper && (
-            <p className="text-xs text-muted-foreground/80">{nextAction.helper}</p>
+        <div className="flex gap-2">
+          {guard && (
+            <TriangleAlert
+              size={16}
+              className={cn("mt-0.5 shrink-0", block ? "text-destructive" : "text-destructive/70")}
+            />
           )}
+          <div className="flex flex-col gap-1">
+            <p className="text-base font-semibold text-foreground">{nextAction.title}</p>
+            <p className="text-sm text-muted-foreground">{nextAction.description}</p>
+            {nextAction.helper && (
+              <p className="text-xs text-muted-foreground/80">{nextAction.helper}</p>
+            )}
+          </div>
         </div>
+
+        {guard && (
+          <GuardFlow
+            here={status?.branch ?? "this branch"}
+            fileCount={status?.dirty_count ?? 0}
+            slug={(values.slug ?? "").trim()}
+            kind={(values.kind as WorkItemKind) ?? "feature"}
+          />
+        )}
 
         {nextAction.primary === null && (
           <p className="text-xs text-muted-foreground">Nothing for you to do right now.</p>
@@ -108,7 +138,9 @@ export function NextActionCard({
                 <Input
                   key={f}
                   value={values[f] ?? ""}
-                  onChange={(e) => set(f, e.target.value)}
+                  onChange={(e) =>
+                    set(f, f === "slug" ? slugify(e.target.value) : e.target.value)
+                  }
                   placeholder={FIELD_PLACEHOLDER[f]}
                 />
               ),
@@ -125,5 +157,38 @@ export function NextActionCard({
         {error && <ErrorLine error={error} onRetry={def?.run ? trigger : undefined} />}
       </div>
     </Card>
+  )
+}
+
+/** Responsive "from -> to" flow. Chips wrap under each other on a narrow
+ *  window; the arrow rotates to point down when they stack. */
+function GuardFlow({
+  here,
+  fileCount,
+  slug,
+  kind,
+}: {
+  here: string
+  fileCount: number
+  slug: string
+  kind: WorkItemKind
+}) {
+  const target = `${kind}/${slug || "…"}`
+  const chip = "rounded border border-border bg-background px-2 py-1"
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-xs">
+      <span className={cn(chip, "inline-flex items-center gap-1")}>
+        <Lock size={11} className="text-destructive/70" />
+        <span className="font-medium text-foreground">{here}</span>
+        <span className="text-muted-foreground">
+          locked{fileCount > 0 ? ` · ${fileCount} file${fileCount === 1 ? "" : "s"}` : ""}
+        </span>
+      </span>
+      <ArrowRight size={14} className="shrink-0 text-muted-foreground" />
+      <span className={cn(chip, "inline-flex items-center gap-1")}>
+        <span className="font-medium text-foreground">{target}</span>
+        <span className="text-muted-foreground">changes kept</span>
+      </span>
+    </div>
   )
 }

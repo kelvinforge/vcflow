@@ -29,9 +29,10 @@ export interface RepoStatus {
   diverged: boolean
   /** The repo's production branch: "main" or "master", whichever exists. */
   production_branch: string
-  /** Current branch is protected (main/master/develop) — Workflow Guard covers
-   *  it. UI hint only; enforcement is in the command layer. */
-  branch_protected: boolean
+  /** Workflow Guard severity for the current branch: "block" (main/master),
+   *  "warn" (develop), or null. UI hint only; enforcement is in the command
+   *  layer. */
+  branch_guard: "block" | "warn" | null
 }
 
 export interface RepoStatusWithPath {

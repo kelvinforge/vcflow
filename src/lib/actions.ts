@@ -90,7 +90,7 @@ export const ACTIONS: Record<PrimaryActionId, ActionDef> = {
       createWorkItem(repoPath, (values.kind as WorkItemKind) ?? "feature", values.slug ?? ""),
   },
   move_to_new_branch: {
-    label: "Move Changes to New Branch",
+    label: "Move changes",
     icon: GitBranchPlus,
     kind: "trigger",
     fields: ["kind", "slug"],
