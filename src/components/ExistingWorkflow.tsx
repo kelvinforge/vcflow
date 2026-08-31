@@ -58,6 +58,12 @@ export function ExistingWorkflow({ wf }: { wf: WorkflowState }) {
       <StartPanel
         repoPath={wf.repoPath}
         currentBranch={wf.status?.branch ?? null}
+        developInSync={
+          !!wf.status &&
+          wf.status.ahead === 0 &&
+          wf.status.behind === 0 &&
+          !wf.status.diverged
+        }
         onChanged={wf.refreshNow}
         extra={
           <BranchInspector
