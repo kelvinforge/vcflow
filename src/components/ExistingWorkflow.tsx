@@ -53,6 +53,7 @@ export function ExistingWorkflow({ wf }: { wf: WorkflowState }) {
 
       <StartPanel
         repoPath={wf.repoPath}
+        currentBranch={wf.status?.branch ?? null}
         onChanged={wf.refreshNow}
         extra={
           <BranchInspector
@@ -89,8 +90,14 @@ export function ExistingWorkflow({ wf }: { wf: WorkflowState }) {
 
       {wf.status && <RepoStateStrip status={wf.status} />}
 
-      <Section title="Review Handoff" defaultOpen>
-        <MrPanel mr={wf.mr} hotfix={wf.hotfix} />
+      <Section title={wf.release ? "Active Release" : "Review Handoff"} defaultOpen>
+        <MrPanel
+          mr={wf.mr}
+          hotfix={wf.hotfix}
+          release={wf.release}
+          repoPath={wf.repoPath}
+          onChanged={wf.refreshNow}
+        />
       </Section>
 
       {/* Only surfaces when the backend actually routes a merge conflict here. */}

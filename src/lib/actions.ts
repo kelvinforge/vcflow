@@ -9,6 +9,7 @@ import { GitCommitVertical, GitPullRequestArrow, Play, Rocket, TriangleAlert, Un
 import {
   createWorkItem,
   finishHotfix,
+  finishRelease,
   finishWorkItem,
   commitWorkItem,
   pushWorkItem,
@@ -63,6 +64,20 @@ export const ACTIONS: Record<PrimaryActionId, ActionDef> = {
     kind: "trigger",
     fields: ["title"],
     run: ({ repoPath, values }) => finishHotfix(repoPath, values.title ?? ""),
+  },
+  finish_release: {
+    label: "Submit release (push + open MR → production)",
+    icon: Rocket,
+    kind: "trigger",
+    fields: ["title"],
+    run: ({ repoPath, values }) => finishRelease(repoPath, values.title ?? ""),
+  },
+  // Panel-button only (Active Release panel), never surfaced by NextActionCard.
+  sync_develop: {
+    label: "Sync develop",
+    icon: Undo2,
+    kind: "guidance",
+    fields: [],
   },
   start_work_item: {
     label: "Start work item",

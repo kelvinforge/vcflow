@@ -54,6 +54,8 @@ export type PrimaryActionId =
   | "push"
   | "finish"
   | "finish_hotfix"
+  | "finish_release"
+  | "sync_develop"
   | "return_to_develop"
   | "start_work_item"
 
@@ -131,6 +133,81 @@ export interface VersionPreview {
 
 export function getHotfixVersionPreview(repoPath: string): Promise<VersionPreview> {
   return invoke<VersionPreview>("get_hotfix_version_preview", { repoPath })
+}
+
+// --- Release workflow --------------------------------------------------
+
+export interface PendingCandidate {
+  branch: string
+  version: string
+  mr_iid: string
+  merged: boolean
+}
+
+export interface ReleasePreview {
+  current_version: string
+  commit_count: number
+  /** "major" | "minor" | "patch". */
+  impact: string
+  suggested_version: string
+  /** Markdown lines to prefill the CHANGELOG textarea. */
+  changelog_seed: string[]
+  pending_candidates: PendingCandidate[]
+}
+
+export interface SupersededCandidate {
+  version: string
+  branch: string
+  mr_iid: string
+  web_url: string | null
+}
+
+export interface ReleaseStatusDto {
+  version: string
+  candidate_branch: string
+  production: MrStatus | null
+  sync: MrStatus | null
+  /** Production MR merged, no sync MR yet -> show [Sync Develop]. */
+  sync_required: boolean
+  complete: boolean
+  superseded: SupersededCandidate[]
+}
+
+export function getReleasePreview(repoPath: string): Promise<ReleasePreview> {
+  return invoke<ReleasePreview>("get_release_preview", { repoPath })
+}
+
+/** Throws with a "SYNC_REQUIRED: …" or "SUPERSEDE_REQUIRED: …" prefixed
+ *  message the caller classifies. */
+export function createReleaseCandidate(
+  repoPath: string,
+  version: string,
+  changelogBody: string,
+  supersedeConfirmed: boolean,
+): Promise<RepoStatusWithPath> {
+  return invoke<RepoStatusWithPath>("create_release_candidate", {
+    repoPath,
+    version,
+    changelogBody,
+    supersedeConfirmed,
+  })
+}
+
+export function finishRelease(repoPath: string, title: string): Promise<RepoStatusWithPath> {
+  return invoke<RepoStatusWithPath>("finish_release", { repoPath, title })
+}
+
+export function syncDevelopAfterRelease(
+  repoPath: string,
+  candidateBranch: string,
+  title: string,
+): Promise<RepoStatus> {
+  return invoke<RepoStatus>("sync_develop_after_release", { repoPath, candidateBranch, title })
+}
+
+/** null => no release candidate tracked for this repo. */
+export function getReleaseStatus(repoPath: string): Promise<ReleaseStatusDto | null> {
+  return invoke<ReleaseStatusDto | null>("get_release_status", { repoPath })
 }
 
 // --- Saved Work (Work Safe) --------------------------------------------

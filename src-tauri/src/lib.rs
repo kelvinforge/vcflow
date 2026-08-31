@@ -51,6 +51,11 @@ pub fn run() {
       commands::get_audit_log,
       commands::get_command_log,
       commands::get_hotfix_version_preview,
+      commands::get_release_preview,
+      commands::create_release_candidate,
+      commands::finish_release,
+      commands::sync_develop_after_release,
+      commands::get_release_status,
       commands::open_working_directory,
       commands::open_url
     ])

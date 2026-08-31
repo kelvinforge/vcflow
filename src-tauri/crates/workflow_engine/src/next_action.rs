@@ -24,6 +24,9 @@ pub enum BranchClass {
     /// `feature/*`, `bug/*`, `chore/*`.
     WorkItem,
     Hotfix,
+    /// `release/x.y.z[-N]` -- a short-lived release-preparation branch. Not a
+    /// development branch: it carries only VERSION + CHANGELOG.
+    Release,
     Develop,
     Master,
     Other,
@@ -63,6 +66,14 @@ pub enum PrimaryAction {
     /// sync MR), in one gated step. Distinct from `Finish` so the frontend
     /// never has to inspect the branch prefix to pick the command.
     FinishHotfix,
+    /// Push + open the `release/x.y.z -> production` MR, in one gated step.
+    /// The `production -> develop` sync is a separate action (`SyncDevelop`),
+    /// surfaced only after a candidate actually merges.
+    FinishRelease,
+    /// Owner-only: open the `production -> develop` sync MR after a release
+    /// candidate merged. Never emitted by `next_action` -- the Active Release
+    /// panel drives it; the variant exists so the command layer has one id.
+    SyncDevelop,
     ReturnToDevelop,
     StartWorkItem,
 }
@@ -128,6 +139,35 @@ pub fn next_action(s: &WorkflowSnapshot) -> NextAction {
                 helper: None,
             };
         }
+    }
+
+    // A release-preparation branch has only three states here: a half-done op
+    // or divergence (handled above), a dirty tree (product code that doesn't
+    // belong -- no Commit offered), or clean and ready to finish.
+    if s.branch == BranchClass::Release {
+        if s.dirty {
+            return NextAction {
+                title: "Release branches carry only VERSION and CHANGELOG".into(),
+                description: "There are uncommitted changes on this release branch. Product code \
+                              belongs on a bug/* branch off develop, not here -- this tool will \
+                              not commit it on a release branch."
+                    .into(),
+                primary: None,
+                helper: Some(
+                    "Save your work, switch back to develop, and start a bug/* branch for it."
+                        .into(),
+                ),
+            };
+        }
+        return NextAction {
+            title: "Finish the release".into(),
+            description: "VERSION and CHANGELOG are committed. Push the branch and open the \
+                          release merge request into the production branch. The \
+                          production -> develop sync is a separate step once it merges."
+                .into(),
+            primary: Some(PrimaryAction::FinishRelease),
+            helper: None,
+        };
     }
 
     match s.work_item {
@@ -266,6 +306,37 @@ mod tests {
 
         let clean = WorkflowSnapshot { branch: BranchClass::Hotfix, ..base() };
         assert_eq!(next_action(&clean).primary, Some(PrimaryAction::FinishHotfix));
+    }
+
+    #[test]
+    fn release_dirty_gives_guidance_clean_finishes() {
+        let dirty = WorkflowSnapshot {
+            branch: BranchClass::Release,
+            work_item: WorkItemState::NotStarted,
+            dirty: true,
+            ..base()
+        };
+        let a = next_action(&dirty);
+        assert_eq!(a.primary, None);
+        assert!(a.helper.is_some());
+
+        let clean = WorkflowSnapshot {
+            branch: BranchClass::Release,
+            work_item: WorkItemState::NotStarted,
+            ..base()
+        };
+        assert_eq!(next_action(&clean).primary, Some(PrimaryAction::FinishRelease));
+    }
+
+    #[test]
+    fn release_in_progress_op_still_wins() {
+        let s = WorkflowSnapshot {
+            branch: BranchClass::Release,
+            in_progress_op: Some("rebase".into()),
+            dirty: true,
+            ..base()
+        };
+        assert_eq!(next_action(&s).primary, Some(PrimaryAction::ResolveInWorkingDir));
     }
 
     #[test]
