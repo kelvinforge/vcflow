@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 — 2026-08-31
+
+### Other
+- chore: add mac + windows release CI workflow
+
 ## 0.2.0 — 2026-08-31
 
 ### Features
