@@ -183,6 +183,11 @@ export interface ReleasePreview {
   /** Markdown lines to prefill the CHANGELOG textarea. */
   changelog_seed: string[]
   pending_candidates: PendingCandidate[]
+  /**
+   * Commits on origin/<production> that origin/develop lacks. Non-zero =>
+   * production is ahead; sync production -> develop before preparing a release.
+   */
+  production_commits_not_in_develop: number
 }
 
 export interface SupersededCandidate {
