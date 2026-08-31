@@ -5,13 +5,14 @@
 // button say and which command does it call".
 
 import type { LucideIcon } from "lucide-react"
-import { ArrowDownToLine, GitCommitVertical, GitPullRequestArrow, Play, Rocket, TriangleAlert, Undo2, Upload } from "lucide-react"
+import { ArrowDownToLine, GitBranchPlus, GitCommitVertical, GitPullRequestArrow, Play, Rocket, TriangleAlert, Undo2, Upload } from "lucide-react"
 import {
   createWorkItem,
   finishHotfix,
   finishRelease,
   finishWorkItem,
   commitWorkItem,
+  moveChangesToNewBranch,
   pushWorkItem,
   updateBranch,
   type PrimaryActionId,
@@ -87,6 +88,31 @@ export const ACTIONS: Record<PrimaryActionId, ActionDef> = {
     fields: ["kind", "slug"],
     run: ({ repoPath, values }) =>
       createWorkItem(repoPath, (values.kind as WorkItemKind) ?? "feature", values.slug ?? ""),
+  },
+  move_to_new_branch: {
+    label: "Move Changes to New Branch",
+    icon: GitBranchPlus,
+    kind: "trigger",
+    fields: ["kind", "slug"],
+    run: async ({ repoPath, values }) => {
+      const out = await moveChangesToNewBranch(
+        repoPath,
+        (values.kind as WorkItemKind) ?? "feature",
+        values.slug ?? "",
+      )
+      if (out.restore_outcome === "conflict")
+        throw new Error(
+          `Changes moved to ${out.new_branch}, but re-applying them hit conflicts in: ` +
+            `${out.conflicting_files.join(", ")}. The markers are in your working directory on ` +
+            `${out.new_branch} — resolve them and commit. Nothing was discarded.`,
+        )
+      if (out.restore_outcome === "error")
+        throw new Error(
+          `Moved to ${out.new_branch}, but your saved changes could not be re-applied ` +
+            `automatically. Use Resume in the Saved work panel.`,
+        )
+      return out
+    },
   },
   resolve_mr_conflict: {
     label: "Resolve merge conflict",
