@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 — 2026-08-31
+
+### Features
+- feat(release): also gate Prepare Release on an idle develop
+- feat(release): gate Prepare Release button on develop/production divergence
+
+### Fixes
+- fix(workflow): offer commit/finish for new work on a merged branch
+
+### Other
+- hore(ci): point macOS release build at Homebrew OpenSSL
+
 ## 0.2.2 — 2026-08-31
 
 ### Other
