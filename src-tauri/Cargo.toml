@@ -36,7 +36,10 @@ git_core = { path = "crates/git_core" }
 provider_core = { path = "crates/provider_core" }
 workflow_engine = { path = "crates/workflow_engine" }
 auth_core = { path = "crates/auth_core" }
-git2 = "0.20"
+# vendored-openssl builds OpenSSL from source per target, so the
+# universal-apple-darwin cross-compile links its own x86_64/aarch64 slices
+# instead of Homebrew's single-arch libs. vendored-libgit2 keeps libgit2 in sync.
+git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["json"] }
 dirs = "6"
