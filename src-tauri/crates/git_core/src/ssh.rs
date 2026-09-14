@@ -1,3 +1,7 @@
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
 use git2::{Cred, Direction, RemoteCallbacks, Repository};
 use thiserror::Error;
 
@@ -8,6 +12,12 @@ pub enum SshError {
     #[error("could not reach remote: {0}")]
     Unreachable(String),
 }
+
+/// `connect_auth` is a raw blocking libgit2/libssh2 call with no timeout of
+/// its own -- a silently-dropping firewall/proxy (common right after
+/// switching a remote between SSH and HTTPS) hangs it forever, and the
+/// preflight check never resolves. Bound it externally instead.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// SSH auth for `git@host:path` remotes has no credentials callback by
 /// default -- git2 fails every SSH connection with "authentication failed"
@@ -54,7 +64,38 @@ pub(crate) fn make_credentials_callback(
 /// Attempts to connect to the repo's `origin` remote over its configured
 /// transport (SSH or HTTPS) without fetching or pushing anything. Never
 /// creates, uploads, or modifies keys -- read-only connectivity check.
+///
+/// Runs the actual connection on a helper thread bounded by
+/// [`CONNECT_TIMEOUT`], so a hung network never blocks the caller
+/// indefinitely -- git2's `Repository` isn't `Send`, so the repo is reopened
+/// by path inside the helper thread rather than moved across it.
 pub fn validate_remote_connection(repo: &Repository) -> Result<(), SshError> {
+    // Fail fast, on the caller's thread, when there's nothing to connect to.
+    if repo.find_remote("origin").is_err() {
+        return Err(SshError::NoOrigin);
+    }
+
+    let repo_dir = repo.path().to_path_buf();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = connect_once(&repo_dir);
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(CONNECT_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(SshError::Unreachable("connection timed out".to_string()))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(SshError::Unreachable("connection check failed unexpectedly".to_string()))
+        }
+    }
+}
+
+fn connect_once(repo_dir: &std::path::Path) -> Result<(), SshError> {
+    let repo = Repository::open(repo_dir).map_err(|_| SshError::NoOrigin)?;
     let mut remote = repo.find_remote("origin").map_err(|_| SshError::NoOrigin)?;
 
     let mut callbacks = RemoteCallbacks::new();

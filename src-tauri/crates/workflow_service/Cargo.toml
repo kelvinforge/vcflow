@@ -1,0 +1,18 @@
+[package]
+name = "workflow_service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+git2 = "0.20"
+serde = { version = "1", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+git_core = { path = "../git_core" }
+workflow_engine = { path = "../workflow_engine" }
+provider_core = { path = "../provider_core" }
+auth_core = { path = "../auth_core" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }

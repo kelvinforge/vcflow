@@ -1,0 +1,72 @@
+{
+  "name": "vcflow-vscode",
+  "displayName": "VCFlow",
+  "description": "VCFlow workflow view: branch, working tree, next action and work items -- read-only, backed by the vcflow CLI.",
+  "version": "0.0.1",
+  "private": true,
+  "icon": "resources/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vcflow",
+          "title": "VCFlow",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "vcflow": [
+        {
+          "id": "vcflowView",
+          "name": "Workflow"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "vcflow.refresh",
+        "title": "VCFlow: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "vcflow.selectWorkspace",
+        "title": "VCFlow: Select Workspace Folder"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "vcflow.refresh",
+          "when": "view == vcflowView",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "VCFlow",
+      "properties": {
+        "vcflow.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the vcflow executable. Leave empty to auto-detect a dev build (src-tauri/target/debug|release/vcflow) in the workspace, or an extension-bundled binary."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
