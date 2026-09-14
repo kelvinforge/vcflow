@@ -28,6 +28,14 @@ function activate(context) {
         }
         await (0, actions_1.runNextAction)(context, folder, primary, () => provider.refresh());
     }));
+    context.subscriptions.push(vscode.commands.registerCommand("vcflow.saveToken", async () => {
+        const folder = (0, workspace_1.currentWorkspaceFolder)(context);
+        if (!folder) {
+            void vscode.window.showWarningMessage("VCFlow: no workspace folder is open.");
+            return;
+        }
+        await (0, actions_1.saveToken)(context, folder, () => provider.refresh());
+    }));
     // Keep the view current as the window's folder set changes (folder
     // added/removed in a multi-root workspace) -- never on a keybinding, and
     // never intercepting keyboard input globally.

@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { VcflowTreeProvider } from "./treeProvider";
-import { pickWorkspaceFolder } from "./workspace";
-import { runNextAction } from "./actions";
+import { pickWorkspaceFolder, currentWorkspaceFolder } from "./workspace";
+import { runNextAction, saveToken } from "./actions";
 
 export function activate(context: vscode.ExtensionContext): void {
   const provider = new VcflowTreeProvider(context);
@@ -36,6 +36,16 @@ export function activate(context: vscode.ExtensionContext): void {
         await runNextAction(context, folder, primary, () => provider.refresh());
       },
     ),
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("vcflow.saveToken", async () => {
+      const folder = currentWorkspaceFolder(context);
+      if (!folder) {
+        void vscode.window.showWarningMessage("VCFlow: no workspace folder is open.");
+        return;
+      }
+      await saveToken(context, folder, () => provider.refresh());
+    }),
   );
 
   // Keep the view current as the window's folder set changes (folder

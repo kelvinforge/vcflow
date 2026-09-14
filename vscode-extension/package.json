@@ -38,12 +38,22 @@
       {
         "command": "vcflow.selectWorkspace",
         "title": "VCFlow: Select Workspace Folder"
+      },
+      {
+        "command": "vcflow.saveToken",
+        "title": "VCFlow: Save Token",
+        "icon": "$(key)"
       }
     ],
     "menus": {
       "view/title": [
         {
           "command": "vcflow.refresh",
+          "when": "view == vcflowView",
+          "group": "navigation"
+        },
+        {
+          "command": "vcflow.saveToken",
           "when": "view == vcflowView",
           "group": "navigation"
         }

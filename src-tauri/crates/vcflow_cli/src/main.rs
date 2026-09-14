@@ -26,11 +26,12 @@
 //!   release-sync              -> sync_develop_after_release
 //!   release-status            -> get_release_status
 //!   update-branch             -> update_branch
+//!   save-token                -> save_token
 //!
 //! Not exposed here (Tauri-only, per the task scope): setup/preflight wizard,
-//! credential/token management, conflict resolution, role overrides, audit
-//! log viewing, and OS-integration commands (open folder/URL). None of these
-//! are workflow orchestration -- see the Remaining Work section of the report.
+//! conflict resolution, role overrides, audit log viewing, and OS-integration
+//! commands (open folder/URL). None of these are workflow orchestration --
+//! see the Remaining Work section of the report.
 
 use std::process::ExitCode;
 
@@ -143,6 +144,12 @@ async fn run(command: &str, args: &[String]) -> Result<(), String> {
         }
         "release-status" => print_json(&workflow_service::get_release_status(repo()?).await?),
         "update-branch" => print_json(&workflow_service::update_branch(repo()?).await?),
+        "save-token" => {
+            let host = require_flag(args, "--host")?;
+            let token = require_flag(args, "--token")?;
+            workflow_service::save_token(repo()?, host, token).await?;
+            print_json(&serde_json::json!({ "ok": true }))
+        }
         other => return Err(format!("unknown command '{other}'")),
     }
     Ok(())

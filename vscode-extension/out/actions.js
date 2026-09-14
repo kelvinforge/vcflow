@@ -8,6 +8,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.isActionable = isActionable;
 exports.runNextAction = runNextAction;
+exports.saveToken = saveToken;
 const vscode = require("vscode");
 const vcflowClient_1 = require("./vcflowClient");
 /** `null` return means "nothing to run" (user cancelled a prompt, or this
@@ -115,6 +116,63 @@ async function runNextAction(context, folder, primary, onDone) {
     }
     try {
         await (0, vcflowClient_1.runVcflow)(exe, args, repoPath);
+        await onDone();
+    }
+    catch (e) {
+        const message = e instanceof vcflowClient_1.VcflowError ? e.message : String(e);
+        void vscode.window.showErrorMessage(`VCFlow: ${message}`);
+    }
+}
+function hostFromRemoteUrl(remoteUrl) {
+    if (!remoteUrl)
+        return undefined;
+    const sshMatch = remoteUrl.match(/^git@([^:]+):/);
+    if (sshMatch)
+        return sshMatch[1];
+    const httpMatch = remoteUrl.match(/^https?:\/\/([^/]+)\//);
+    if (httpMatch)
+        return httpMatch[1];
+    return undefined;
+}
+/** Prompts for host + token (masked) and saves it into the OS keychain via
+ * `vcflow save-token` -- the same keychain entry the Tauri app and CLI read,
+ * so fixing it here fixes every frontend. Never logs or displays the token
+ * value anywhere but the masked input box itself. */
+async function saveToken(context, folder, onDone) {
+    const repoPath = folder.uri.fsPath;
+    let exe;
+    try {
+        exe = (0, vcflowClient_1.resolveExecutable)(context, folder);
+    }
+    catch (e) {
+        void vscode.window.showErrorMessage(e.message);
+        return;
+    }
+    let defaultHost;
+    try {
+        const status = (await (0, vcflowClient_1.runVcflow)(exe, ["repo-status", "--repo", repoPath], repoPath));
+        defaultHost = hostFromRemoteUrl(status.remote_url);
+    }
+    catch {
+        // Best-effort prefill only -- an unreadable repo still gets the prompt.
+    }
+    const host = await vscode.window.showInputBox({
+        prompt: "Provider host",
+        value: defaultHost ?? "github.com",
+        ignoreFocusOut: true,
+    });
+    if (!host)
+        return;
+    const token = await vscode.window.showInputBox({
+        prompt: `Personal access token for ${host}`,
+        password: true,
+        ignoreFocusOut: true,
+    });
+    if (!token)
+        return;
+    try {
+        await (0, vcflowClient_1.runVcflow)(exe, ["save-token", "--repo", repoPath, "--host", host, "--token", token], repoPath);
+        void vscode.window.showInformationMessage(`VCFlow: token saved for ${host}.`);
         await onDone();
     }
     catch (e) {
