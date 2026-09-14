@@ -22,6 +22,7 @@ pub fn run() {
       commands::initialize_workflow,
       commands::get_setup_state,
       commands::save_token,
+      commands::set_remote_url,
       commands::create_work_item,
       commands::move_changes_to_new_branch,
       commands::commit_work_item,

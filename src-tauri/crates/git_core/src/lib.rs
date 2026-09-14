@@ -31,13 +31,13 @@ pub use op_state::{in_progress_operation, InProgressOp};
 pub use preflight::{
     assemble_preflight, Check, CheckStatus, Preflight, PreflightProvider,
 };
-pub use release::{create_release_branch, ReleaseError};
+pub use release::{create_release_branch, release_reached_branch, ReleaseError};
 pub use release_scope::{
     changelog_seed, commits_to_release, conventional_bump, suggest_version, Bump, CommitInfo,
 };
 pub use repo::{
     head_branch, is_dirty, production_branch, read_file_at_ref, read_repo_info, ref_exists,
-    RepoError, RepoInfo,
+    set_remote_url, RepoError, RepoInfo,
 };
 pub use repo_state::{read_repository_state, RepoStateError, RepositoryState};
 pub use save_work::{discard_work, restore_work, save_work, SavedWork, SaveWorkError};

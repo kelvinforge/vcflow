@@ -85,6 +85,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "workflow_engine",
+ "workflow_service",
 ]
 
 [[package]]
@@ -4577,6 +4578,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vcflow_cli"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "workflow_service",
+]
+
+[[package]]
 name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5332,6 +5343,22 @@ version = "0.1.0"
 dependencies = [
  "git_core",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "workflow_service"
+version = "0.1.0"
+dependencies = [
+ "auth_core",
+ "chrono",
+ "git2",
+ "git_core",
+ "provider_core",
+ "reqwest 0.12.28",
+ "serde",
+ "tempfile",
+ "tokio",
+ "workflow_engine",
 ]
 
 [[package]]

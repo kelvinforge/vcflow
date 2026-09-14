@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/git_core", "crates/provider_core", "crates/workflow_engine", "crates/auth_core"]
+members = [".", "crates/git_core", "crates/provider_core", "crates/workflow_engine", "crates/auth_core", "crates/workflow_service", "crates/vcflow_cli"]
 resolver = "2"
 
 [package]
@@ -36,6 +36,7 @@ git_core = { path = "crates/git_core" }
 provider_core = { path = "crates/provider_core" }
 workflow_engine = { path = "crates/workflow_engine" }
 auth_core = { path = "crates/auth_core" }
+workflow_service = { path = "crates/workflow_service" }
 # vendored-openssl builds OpenSSL from source per target, so the
 # universal-apple-darwin cross-compile links its own x86_64/aarch64 slices
 # instead of Homebrew's single-arch libs. vendored-libgit2 keeps libgit2 in sync.

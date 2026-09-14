@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { CheckCircle2, Circle, Loader2, XCircle } from "lucide-react"
-import { resumeWork, type SetupStateDto } from "@/lib/tauri"
-import { Badge, Button, Card, ErrorLine } from "@/components/ui"
+import { resumeWork, setRemoteUrl, type SetupStateDto } from "@/lib/tauri"
+import { Badge, Button, Card, ErrorLine, Input } from "@/components/ui"
 
 /**
  * The setup gate's card. Shown whenever `setup.phase !== "ready"`; once the
@@ -86,6 +86,7 @@ export function SetupCard({
           <Button className="self-start" onClick={onRefresh}>
             Re-check
           </Button>
+          <RemoteUrlForm repoPath={repoPath} remoteUrl={state.remote_url} onUpdated={onRefresh} />
         </>
       )}
 
@@ -155,6 +156,67 @@ function CheckIcon({ status }: { status: string }) {
   if (status === "pass") return <CheckCircle2 size={14} className="mt-0.5 text-primary" />
   if (status === "warning") return <Circle size={14} className="mt-0.5 text-muted-foreground" />
   return <XCircle size={14} className="mt-0.5 text-destructive" />
+}
+
+function RemoteUrlForm({
+  repoPath,
+  remoteUrl,
+  onUpdated,
+}: {
+  repoPath: string
+  remoteUrl: string | null
+  onUpdated: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [url, setUrl] = useState(remoteUrl ?? "")
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  if (!open) {
+    return (
+      <Button className="self-start" onClick={() => setOpen(true)}>
+        Change remote URL
+      </Button>
+    )
+  }
+
+  const save = async () => {
+    setSaving(true)
+    setError(null)
+    try {
+      await setRemoteUrl(repoPath, url.trim())
+      setOpen(false)
+      onUpdated()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-2 rounded border border-border p-2">
+      <label className="text-xs text-muted-foreground" htmlFor="remote-url-input">
+        origin remote URL
+      </label>
+      <Input
+        id="remote-url-input"
+        value={url}
+        onChange={(e) => setUrl(e.target.value)}
+        placeholder="https://gitlab.com/group/repo.git"
+        disabled={saving}
+      />
+      <div className="flex items-center gap-2">
+        <Button variant="primary" disabled={saving || url.trim() === ""} onClick={save}>
+          {saving ? "Saving…" : "Save"}
+        </Button>
+        <Button disabled={saving} onClick={() => setOpen(false)}>
+          Cancel
+        </Button>
+      </div>
+      {error && <ErrorLine error={error} />}
+    </div>
+  )
 }
 
 function RecoverList({

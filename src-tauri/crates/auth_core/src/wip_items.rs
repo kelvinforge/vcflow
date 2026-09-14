@@ -91,6 +91,20 @@ impl WipItemLog {
         Ok(())
     }
 
+    /// Advance a still-open (`active` / `waiting`) row to `completed`, returning
+    /// whether a row was actually moved. A missing row or one already in a
+    /// terminal state (`completed` / `dropped` / `superseded`) is left
+    /// untouched -- reconciliation must never resurrect or override a
+    /// deliberate end state.
+    pub fn complete_if_open(&self, repository: &str, branch: &str) -> Result<bool, AuditError> {
+        let changed = self.conn.execute(
+            "UPDATE wip_items SET status = 'completed', updated_at = ?3
+             WHERE repository = ?1 AND branch = ?2 AND status IN ('active', 'waiting')",
+            params![repository, branch, Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Items still worth showing for `repository`: `active` and `waiting`,
     /// newest first. `completed` and `dropped` are excluded.
     pub fn actionable(&self, repository: &str) -> Result<Vec<WipItem>, AuditError> {
@@ -188,6 +202,26 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "active");
         assert_eq!(rows[0].created_at, created);
+    }
+
+    #[test]
+    fn complete_if_open_only_moves_active_or_waiting_rows() {
+        let (_d, log) = open_log();
+        log.start("/a", "release/1.4.0", "release").unwrap();
+        assert!(log.complete_if_open("/a", "release/1.4.0").unwrap());
+        assert_eq!(log.get(1).unwrap().unwrap().status, "completed");
+
+        // second call is a no-op (already terminal).
+        assert!(!log.complete_if_open("/a", "release/1.4.0").unwrap());
+
+        // superseded stays superseded.
+        log.start("/a", "release/1.3.0", "release").unwrap();
+        log.set_status("/a", "release/1.3.0", "superseded").unwrap();
+        assert!(!log.complete_if_open("/a", "release/1.3.0").unwrap());
+        assert_eq!(log.get(2).unwrap().unwrap().status, "superseded");
+
+        // missing row is a no-op.
+        assert!(!log.complete_if_open("/a", "release/9.9.9").unwrap());
     }
 
     #[test]

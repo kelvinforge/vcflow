@@ -418,6 +418,12 @@ export function deleteToken(repoPath: string, host: string): Promise<void> {
   return invoke<void>("delete_token", { repoPath, host })
 }
 
+/** Rewrites the repo's `origin` remote URL, e.g. SSH -> HTTPS so a saved
+ *  access token can authenticate instead of an SSH key/agent. */
+export function setRemoteUrl(repoPath: string, url: string): Promise<void> {
+  return invoke<void>("set_remote_url", { repoPath, url })
+}
+
 // --- Role overrides (Owner-only) -----------------------------------
 
 export interface RoleOverrideDto {
@@ -516,6 +522,8 @@ export interface SetupStateDto {
   phase: SetupPhase
   /** The 7 preflight rows -- always present. */
   checks: CheckDto[]
+  /** `origin`'s current URL, to prefill a "change remote" form. */
+  remote_url: string | null
   needs_git_init: boolean
   /** Working tree dirty (only meaningful for "needs_initial_workflow"). */
   dirty: boolean

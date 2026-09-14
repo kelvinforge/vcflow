@@ -98,6 +98,14 @@ fn unborn_branch_name(repo: &Repository) -> String {
         .unwrap_or_else(|| "main".to_string())
 }
 
+/// Rewrites the `origin` remote's URL (e.g. switching `git@host:...` to
+/// `https://host/...`). Does not touch any other remote config, credentials,
+/// or fetch/push refspecs.
+pub fn set_remote_url(repo: &Repository, url: &str) -> Result<(), RepoError> {
+    repo.remote_set_url("origin", url)?;
+    Ok(())
+}
+
 /// Reads current branch, `origin` remote URL, and repo-root `VERSION` file
 /// for the git repository at `path`.
 pub fn read_repo_info(path: impl AsRef<Path>) -> Result<RepoInfo, RepoError> {
