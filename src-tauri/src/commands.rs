@@ -18,7 +18,8 @@ use workflow_engine::{
 };
 
 use crate::events::WORKFLOW_STATE_CHANGED;
-use crate::repo_lock::{try_with_repo_lock, with_repo_lock, RepoLockRegistry};
+use crate::remote_probe_cache;
+use crate::repo_lock::{self, try_with_repo_lock, with_repo_lock, RepoLockRegistry};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoStatus {
@@ -106,8 +107,9 @@ pub struct HotfixStatus {
 pub async fn get_repo_status(
     repo_path: String,
     registry: State<'_, RepoLockRegistry>,
+    probe_cache: State<'_, remote_probe_cache::RemoteProbeCache>,
 ) -> Result<RepoStatus, String> {
-    build_status(&repo_path, registry.inner()).await
+    build_status_local(&repo_path, registry.inner(), probe_cache.inner()).await
 }
 
 /// Refresh = `git fetch origin` (remote-tracking refs only, never the working
@@ -124,6 +126,7 @@ pub async fn get_repo_status(
 pub async fn refresh_repo_status(
     repo_path: String,
     registry: State<'_, RepoLockRegistry>,
+    probe_cache: State<'_, remote_probe_cache::RemoteProbeCache>,
 ) -> Result<RepoStatus, String> {
     // `fetch_origin` mutates remote-tracking refs, so it runs inside the repo
     // lock. Best-effort exactly as before: a busy lock or a fetch failure
@@ -135,7 +138,9 @@ pub async fn refresh_repo_status(
         Ok::<(), String>(())
     })
     .await;
-    build_status(&repo_path, registry.inner()).await
+    let status = build_status(&repo_path, registry.inner()).await?;
+    record_remote_probe(&repo_path, probe_cache.inner(), &status);
+    Ok(status)
 }
 
 // --- Repository preflight (eligibility gate) + Initial Workflow Setup --------
@@ -256,17 +261,20 @@ fn preflight_dto(pf: git_core::Preflight) -> PreflightDto {
 pub async fn repository_preflight(
     repo_path: String,
     registry: State<'_, RepoLockRegistry>,
+    probe_cache: State<'_, remote_probe_cache::RemoteProbeCache>,
 ) -> Result<PreflightDto, String> {
-    repository_preflight_inner(&repo_path, registry.inner()).await
+    repository_preflight_inner(&repo_path, registry.inner(), probe_cache.inner()).await
 }
 
 /// `State`-free core of `repository_preflight`, so it is directly testable
 /// and so other commands (`initialize_workflow`, `get_setup_state`) can call
-/// it with a plain `&RepoLockRegistry` instead of threading a `State`
-/// through, which only a live Tauri invocation can construct.
+/// it with plain `&RepoLockRegistry`/`&RemoteProbeCache` instead of
+/// threading `State`s through, which only a live Tauri invocation can
+/// construct.
 async fn repository_preflight_inner(
     repo_path: &str,
     registry: &RepoLockRegistry,
+    probe_cache: &remote_probe_cache::RemoteProbeCache,
 ) -> Result<PreflightDto, String> {
     let git_version = detect_git_version();
 
@@ -313,6 +321,27 @@ async fn repository_preflight_inner(
     })
     .await?
     .ok_or("repository is busy with another operation -- try again")?;
+
+    // Share this eligibility gate's own live transport probe with the shared
+    // cache so the 3s `get_repo_status` path (and a Setup Card visible at
+    // the same moment) don't disagree with what preflight just found --
+    // transport-only, never clobbers a fresher provider-API result (see
+    // `RemoteProbeCache::set_transport`).
+    if let Ok(root) = repo_lock::canonical_repo_key(repo_path) {
+        let reachable = pf.checks.iter().find(|c| c.id == "remote_reachable");
+        let auth = pf.checks.iter().find(|c| c.id == "git_auth_available");
+        let ssh_ok = matches!(reachable.map(|c| c.status), Some(git_core::CheckStatus::Pass))
+            && matches!(auth.map(|c| c.status), Some(git_core::CheckStatus::Pass));
+        let ssh_error = if ssh_ok {
+            None
+        } else {
+            reachable
+                .filter(|c| c.status != git_core::CheckStatus::Pass)
+                .or(auth)
+                .map(|c| c.message.clone())
+        };
+        probe_cache.set_transport(root, pf.remote_url.clone(), ssh_ok, ssh_error);
+    }
 
     Ok(preflight_dto(pf))
 }
@@ -375,11 +404,12 @@ pub async fn initialize_workflow(
     app: AppHandle,
     repo_path: String,
     registry: State<'_, RepoLockRegistry>,
+    probe_cache: State<'_, remote_probe_cache::RemoteProbeCache>,
 ) -> Result<WorkflowInitDto, String> {
     // Preflight is read-only eligibility checking -- it goes through its own
     // (try_lock) reads internally and is intentionally NOT held under the
     // blocking mutation lock acquired below.
-    let pf = repository_preflight(repo_path.clone(), registry.clone()).await?;
+    let pf = repository_preflight(repo_path.clone(), registry.clone(), probe_cache.clone()).await?;
     if !pf.eligible {
         let reason = pf
             .checks
@@ -567,20 +597,22 @@ pub struct SetupStateDto {
 pub async fn get_setup_state(
     repo_path: String,
     registry: State<'_, RepoLockRegistry>,
+    probe_cache: State<'_, remote_probe_cache::RemoteProbeCache>,
 ) -> Result<SetupStateDto, String> {
-    get_setup_state_inner(&repo_path, registry.inner()).await
+    get_setup_state_inner(&repo_path, registry.inner(), probe_cache.inner()).await
 }
 
 /// `State`-free core of `get_setup_state`, directly testable.
 async fn get_setup_state_inner(
     repo_path: &str,
     registry: &RepoLockRegistry,
+    probe_cache: &remote_probe_cache::RemoteProbeCache,
 ) -> Result<SetupStateDto, String> {
     // `repository_preflight_inner` acquires and releases its own (try_lock)
     // reads internally before returning -- calling it here is a separate,
     // sequential acquisition, never a nested one, so there is no
     // self-deadlock risk against the try_with_repo_lock call below.
-    let pf = repository_preflight_inner(repo_path, registry).await?;
+    let pf = repository_preflight_inner(repo_path, registry, probe_cache).await?;
 
     let mut dto = SetupStateDto {
         phase: "ready".to_string(),
@@ -649,7 +681,12 @@ async fn get_setup_state_inner(
 /// GitHub remote, `gitlab|<host>|default` otherwise. The token only ever
 /// lives in the keychain -- never localStorage, SQLite, config, or logs.
 #[tauri::command]
-pub async fn save_token(repo_path: String, host: String, token: String) -> Result<(), String> {
+pub async fn save_token(
+    repo_path: String,
+    host: String,
+    token: String,
+    probe_cache: State<'_, remote_probe_cache::RemoteProbeCache>,
+) -> Result<(), String> {
     let remote = git_core::read_repo_info(&repo_path)
         .ok()
         .and_then(|i| i.remote_url);
@@ -666,6 +703,14 @@ pub async fn save_token(repo_path: String, host: String, token: String) -> Resul
     // GitLab credential on any other host is never touched.
     if service == "github" && url_provider == Some(Provider::GitHub) {
         let _ = auth_core::CredentialStore::delete("gitlab", &host, "default");
+    }
+
+    // The cached role/gitlab_ok were computed against the OLD (or no) token
+    // -- a stale "false, no token" must not survive the very save that just
+    // fixed it. Invalidate rather than update: the next read (local or
+    // fresh) re-probes for real.
+    if let Ok(root) = repo_lock::canonical_repo_key(&repo_path) {
+        probe_cache.invalidate(&root);
     }
     Ok(())
 }
@@ -1349,14 +1394,86 @@ async fn mr_snapshot(client: &ApiClient, mr_iid: &str) -> Option<MrSnapshot> {
     })
 }
 
-/// Build `RepoStatus` without broadcasting. Use this on read-only paths
-/// (`get_repo_status`, `refresh_repo_status`) so a periodic poll never emits
-/// `workflow:state:changed` -- that event means "a mutation happened, re-read
-/// the workflow snapshot", and a poll is not a mutation.
-async fn build_status(repo_path: &str, registry: &RepoLockRegistry) -> Result<RepoStatus, String> {
+/// Local-only, non-network facts shared by both `build_status` (fresh probe)
+/// and `build_status_local` (cache-only probe): everything about `RepoStatus`
+/// except `ssh_ok`/`ssh_error`/`gitlab_ok`/`gitlab_error`/`role`/`provider`.
+struct LocalRepoFacts {
+    branch: String,
+    version: Option<String>,
+    remote_url: Option<String>,
+    dirty: bool,
+    dirty_count: usize,
+    in_progress_op: Option<String>,
+    ahead: usize,
+    behind: usize,
+    diverged: bool,
+    production_branch: String,
+    branch_guard: Option<String>,
+}
+
+async fn local_repo_facts(repo_path: &str, registry: &RepoLockRegistry) -> Result<LocalRepoFacts, String> {
     let info = git_core::read_repo_info(repo_path).map_err(|e| e.to_string())?;
 
-    let mut provider = info
+    // Work Safe read-only state -- best-effort; a repo we can't inspect
+    // (detached HEAD, unreadable), or a repo lock currently held by an
+    // in-flight mutation elsewhere, both report the same safe-looking
+    // default that an unreadable repo already reported before this lock
+    // existed -- `try_with_repo_lock` folds "busy" and "unreadable" the same
+    // way `.ok()` already did.
+    let ws_read = try_with_repo_lock(registry, repo_path, || {
+        let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
+        let production_branch = git_core::production_branch(&repo);
+        let state = git_core::read_repository_state(&repo).ok();
+        Ok::<_, String>((production_branch, state))
+    })
+    .await
+    .unwrap_or(None);
+    let (production_branch, ws) = match ws_read {
+        Some((pb, state)) => (pb.unwrap_or_else(|| "main".to_string()), state),
+        None => ("main".to_string(), None),
+    };
+    let (dirty, dirty_count, in_progress_op, ahead, behind, diverged) = match ws {
+        Some(s) => {
+            let up = s.upstream.unwrap_or_default();
+            (
+                s.working_tree.is_dirty(),
+                s.working_tree.total_count(),
+                s.in_progress_op.map(|o| o.label().to_string()),
+                up.ahead,
+                up.behind,
+                up.is_diverged(),
+            )
+        }
+        None => (false, 0, None, 0, 0, false),
+    };
+
+    let branch_guard = branch_guard(&info.current_branch).map(str::to_string);
+    Ok(LocalRepoFacts {
+        branch: info.current_branch,
+        version: info.version,
+        remote_url: info.remote_url,
+        dirty,
+        dirty_count,
+        in_progress_op,
+        ahead,
+        behind,
+        diverged,
+        production_branch,
+        branch_guard,
+    })
+}
+
+/// Build `RepoStatus` without broadcasting, with a fresh live probe of
+/// `ssh_ok`/`gitlab_ok`/`role` -- an actual SSH/HTTPS connect plus a provider
+/// API call. Use this only on paths that are meant to touch the network
+/// (`refresh_repo_status`'s 15s tick, and the ~35 mutating commands' tail
+/// call via `build_and_emit_status`, both of which are already bounded by a
+/// timer or a real user action -- never the 3s `get_repo_status` path, which
+/// is `build_status_local` below).
+async fn build_status(repo_path: &str, registry: &RepoLockRegistry) -> Result<RepoStatus, String> {
+    let facts = local_repo_facts(repo_path, registry).await?;
+
+    let mut provider = facts
         .remote_url
         .as_deref()
         .map(detect_provider)
@@ -1371,7 +1488,7 @@ async fn build_status(repo_path: &str, registry: &RepoLockRegistry) -> Result<Re
     };
 
     let user = whoami_user();
-    let repository_key = info.remote_url.clone().unwrap_or_else(|| repo_path.to_string());
+    let repository_key = facts.remote_url.clone().unwrap_or_else(|| repo_path.to_string());
 
     // Resolve the provider API client once and learn the current user's role
     // from it. A hostname-Unknown remote (self-hosted) is probed live inside
@@ -1379,7 +1496,7 @@ async fn build_status(repo_path: &str, registry: &RepoLockRegistry) -> Result<Re
     // API call can confirm a self-hosted host's provider, a hostname guess
     // can't. The resolved variant then becomes the displayed `provider`.
     let provider_role = if ssh_ok {
-        match provider_client_for(&info.remote_url).await {
+        match provider_client_for(&facts.remote_url).await {
             Some(client) => {
                 let role = role_from_client(&client).await;
                 if role.is_some() {
@@ -1418,61 +1535,103 @@ async fn build_status(repo_path: &str, registry: &RepoLockRegistry) -> Result<Re
 
     let role = resolve_role_best_effort(&user, &repository_key, provider_role, &config);
 
-    // Work Safe read-only state -- best-effort; a repo we can't inspect
-    // (detached HEAD, unreadable), or a repo lock currently held by an
-    // in-flight mutation elsewhere, both report the same safe-looking
-    // default that an unreadable repo already reported before this lock
-    // existed -- `try_with_repo_lock` folds "busy" and "unreadable" the same
-    // way `.ok()` already did.
-    let ws_read = try_with_repo_lock(registry, repo_path, || {
-        let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
-        let production_branch = git_core::production_branch(&repo);
-        let state = git_core::read_repository_state(&repo).ok();
-        Ok::<_, String>((production_branch, state))
-    })
-    .await
-    .unwrap_or(None);
-    let (production_branch, ws) = match ws_read {
-        Some((pb, state)) => (pb.unwrap_or_else(|| "main".to_string()), state),
-        None => ("main".to_string(), None),
-    };
-    let (dirty, dirty_count, in_progress_op, ahead, behind, diverged) = match ws {
-        Some(s) => {
-            let up = s.upstream.unwrap_or_default();
-            (
-                s.working_tree.is_dirty(),
-                s.working_tree.total_count(),
-                s.in_progress_op.map(|o| o.label().to_string()),
-                up.ahead,
-                up.behind,
-                up.is_diverged(),
-            )
-        }
-        None => (false, 0, None, 0, 0, false),
-    };
-
-    let branch_guard = branch_guard(&info.current_branch).map(str::to_string);
-    let status = RepoStatus {
-        branch: info.current_branch,
-        version: info.version,
-        remote_url: info.remote_url,
+    Ok(RepoStatus {
+        branch: facts.branch,
+        version: facts.version,
+        remote_url: facts.remote_url,
         provider: format!("{provider:?}"),
         ssh_ok,
         ssh_error,
         gitlab_ok,
         gitlab_error,
         role,
-        dirty,
-        dirty_count,
-        in_progress_op,
-        ahead,
-        behind,
-        diverged,
-        production_branch,
-        branch_guard,
+        dirty: facts.dirty,
+        dirty_count: facts.dirty_count,
+        in_progress_op: facts.in_progress_op,
+        ahead: facts.ahead,
+        behind: facts.behind,
+        diverged: facts.diverged,
+        production_branch: facts.production_branch,
+        branch_guard: facts.branch_guard,
+    })
+}
+
+/// Build `RepoStatus` with NO network call at all -- `ssh_ok`/`gitlab_ok`/
+/// `role` come only from `RemoteProbeCache`'s last fresh probe (or the
+/// "never probed yet" defaults). This is what the 3s `get_repo_status` path
+/// actually needs: local dirty/branch/ahead/behind responsiveness between
+/// the 15s network ticks, never a live SSH handshake or provider API call.
+///
+/// A cache miss (never probed, or the repo's remote_url changed since the
+/// last probe -- see `RemoteProbeCache::get`) reports the same
+/// not-yet-known `false`/`false` shape the UI already renders before any
+/// probe has ever completed; it never fabricates a success.
+async fn build_status_local(
+    repo_path: &str,
+    registry: &RepoLockRegistry,
+    cache: &remote_probe_cache::RemoteProbeCache,
+) -> Result<RepoStatus, String> {
+    let facts = local_repo_facts(repo_path, registry).await?;
+    let provider = facts
+        .remote_url
+        .as_deref()
+        .map(detect_provider)
+        .unwrap_or(Provider::Unknown);
+
+    let canonical_root = repo_lock::canonical_repo_key(repo_path).ok();
+    let cached = canonical_root.and_then(|root| cache.get(&root, &facts.remote_url));
+
+    let (ssh_ok, ssh_error, gitlab_ok, gitlab_error, role) = match cached {
+        Some(c) => (
+            c.ssh_ok,
+            c.ssh_error,
+            c.gitlab_ok,
+            c.gitlab_error,
+            c.role.unwrap_or_else(|| "unknown (no token)".to_string()),
+        ),
+        None => (false, None, false, None, "unknown (no token)".to_string()),
     };
 
-    Ok(status)
+    Ok(RepoStatus {
+        branch: facts.branch,
+        version: facts.version,
+        remote_url: facts.remote_url,
+        provider: format!("{provider:?}"),
+        ssh_ok,
+        ssh_error,
+        gitlab_ok,
+        gitlab_error,
+        role,
+        dirty: facts.dirty,
+        dirty_count: facts.dirty_count,
+        in_progress_op: facts.in_progress_op,
+        ahead: facts.ahead,
+        behind: facts.behind,
+        diverged: facts.diverged,
+        production_branch: facts.production_branch,
+        branch_guard: facts.branch_guard,
+    })
+}
+
+/// Writes `status`'s freshly-probed `ssh_ok`/`gitlab_ok`/`role` into the
+/// shared cache so the next `build_status_local` call (the 3s poll) sees
+/// this result instead of an older or disagreeing one. Best-effort: a
+/// canonicalization failure just means the write is skipped, same as any
+/// other best-effort audit write in this file.
+fn record_remote_probe(repo_path: &str, cache: &remote_probe_cache::RemoteProbeCache, status: &RepoStatus) {
+    if let Ok(root) = repo_lock::canonical_repo_key(repo_path) {
+        cache.set(
+            root,
+            status.remote_url.clone(),
+            remote_probe_cache::ProbedFields {
+                ssh_ok: status.ssh_ok,
+                ssh_error: status.ssh_error.clone(),
+                gitlab_ok: status.gitlab_ok,
+                gitlab_error: status.gitlab_error.clone(),
+                role: Some(status.role.clone()),
+            },
+        );
+    }
 }
 
 /// Build `RepoStatus` and broadcast `workflow:state:changed`. Mutating
@@ -2637,9 +2796,18 @@ pub async fn re_validate_token(repo_path: String) -> Result<TokenValidation, Str
 /// (no-token) state. Deletes from whichever service (`github`/`gitlab`) the
 /// repo's remote resolves to -- the same dispatch `save_token` uses.
 #[tauri::command]
-pub async fn delete_token(repo_path: String, host: String) -> Result<(), String> {
+pub async fn delete_token(
+    repo_path: String,
+    host: String,
+    probe_cache: State<'_, remote_probe_cache::RemoteProbeCache>,
+) -> Result<(), String> {
     let service = credential_service(&repo_path, &host).await;
-    auth_core::CredentialStore::delete(service, &host, "default").map_err(|e| e.to_string())
+    auth_core::CredentialStore::delete(service, &host, "default").map_err(|e| e.to_string())?;
+    // See `save_token`'s matching comment -- gitlab_ok/role are stale now.
+    if let Ok(root) = repo_lock::canonical_repo_key(&repo_path) {
+        probe_cache.invalidate(&root);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3636,7 +3804,7 @@ mod tests {
     async fn setup_state_plain_dir_is_not_a_repo() {
         isolate_db();
         let dir = tempdir().unwrap();
-        let s = get_setup_state_inner(dir.path().to_str().unwrap(), &RepoLockRegistry::default())
+        let s = get_setup_state_inner(dir.path().to_str().unwrap(), &RepoLockRegistry::default(), &remote_probe_cache::RemoteProbeCache::default())
             .await
             .unwrap();
         assert_eq!(s.phase, "not_a_repo");
@@ -3648,7 +3816,7 @@ mod tests {
         isolate_db();
         let dir = tempdir().unwrap();
         git(dir.path(), &["init", "-b", "main"]);
-        let s = get_setup_state_inner(dir.path().to_str().unwrap(), &RepoLockRegistry::default())
+        let s = get_setup_state_inner(dir.path().to_str().unwrap(), &RepoLockRegistry::default(), &remote_probe_cache::RemoteProbeCache::default())
             .await
             .unwrap();
         assert_eq!(s.phase, "needs_first_commit");
@@ -3665,7 +3833,7 @@ mod tests {
         git(dir.path(), &["add", "a.txt"]);
         git(dir.path(), &["commit", "-m", "init"]);
 
-        let s = get_setup_state_inner(dir.path().to_str().unwrap(), &RepoLockRegistry::default())
+        let s = get_setup_state_inner(dir.path().to_str().unwrap(), &RepoLockRegistry::default(), &remote_probe_cache::RemoteProbeCache::default())
             .await
             .unwrap();
         assert_eq!(s.phase, "preflight_failed");

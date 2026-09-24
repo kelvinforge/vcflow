@@ -55,7 +55,7 @@ impl RepoLockRegistry {
 /// `build_work_list`) check that themselves before calling into this lock,
 /// exactly as they already do without it; this function does not special-case
 /// that for them.
-fn canonical_repo_key(repo_path: &str) -> Result<PathBuf, String> {
+pub(crate) fn canonical_repo_key(repo_path: &str) -> Result<PathBuf, String> {
     let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
     let root = repo.workdir().unwrap_or_else(|| repo.path());
     std::fs::canonicalize(root).map_err(|e| e.to_string())
