@@ -288,15 +288,20 @@ async fn repository_preflight_inner(
     }
 
     // Segment 1 (locked): just read the remote URL -- the only fact the
-    // network step below needs.
-    let remote_url = try_with_repo_lock(registry, repo_path, || {
+    // network step below needs. `with_repo_lock` (waits), not
+    // `try_with_repo_lock` (skips) -- this is a one-shot eligibility check
+    // fired at mount, never a tight poll, so briefly waiting out a
+    // contended lock is correct; treating "busy" as a hard error here
+    // surfaced as the Setup Card showing a full "could not read this
+    // directory" failure for a perfectly healthy repo whenever this raced
+    // another command's own lock acquisition at app launch.
+    let remote_url = with_repo_lock(registry, repo_path, || {
         let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
         Ok::<_, String>(
             repo.find_remote("origin").ok().and_then(|rm| rm.url().map(str::to_string)),
         )
     })
-    .await?
-    .ok_or("repository is busy with another operation -- try again")?;
+    .await?;
 
     // Unlocked: provider classification needs the network (`.await`), so it
     // cannot run inside the lock's synchronous closure.
@@ -307,8 +312,9 @@ async fn repository_preflight_inner(
 
     // Segment 2 (locked): the SSH connectivity probe is a blocking call, not
     // `.await`, so it belongs back inside the lock alongside the final
-    // repository reads `assemble_preflight` itself performs.
-    let pf = try_with_repo_lock(registry, repo_path, || {
+    // repository reads `assemble_preflight` itself performs. Same
+    // wait-not-skip reasoning as segment 1.
+    let pf = with_repo_lock(registry, repo_path, || {
         let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
         let remote_conn =
             remote_url.is_some().then(|| git_core::validate_remote_connection(&repo));
@@ -319,8 +325,7 @@ async fn repository_preflight_inner(
             remote_conn,
         ))
     })
-    .await?
-    .ok_or("repository is busy with another operation -- try again")?;
+    .await?;
 
     // Share this eligibility gate's own live transport probe with the shared
     // cache so the 3s `get_repo_status` path (and a Setup Card visible at
@@ -638,8 +643,11 @@ async fn get_setup_state_inner(
 
     // Preflight already confirmed a real, readable repository exists at this
     // point, so this is an ordinary locked read, not the "not a repository
-    // yet" tolerant case.
-    let (develop, dirty) = try_with_repo_lock(registry, repo_path, || {
+    // yet" tolerant case. `with_repo_lock`, not `try_with_repo_lock` -- see
+    // the matching comment in `repository_preflight_inner`: this is a
+    // one-shot gate check, not a tight poll, so it should wait out a
+    // contended lock rather than surface "busy" as a hard failure.
+    let (develop, dirty) = with_repo_lock(registry, repo_path, || {
         let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
         let develop = develop_exists(&repo);
         let dirty = git_core::read_repository_state(&repo)
@@ -647,8 +655,7 @@ async fn get_setup_state_inner(
             .unwrap_or(false);
         Ok::<_, String>((develop, dirty))
     })
-    .await?
-    .ok_or("repository is busy with another operation -- try again")?;
+    .await?;
 
     if develop {
         let init_related: Vec<SavedWorkDto> = saved_work_log()
