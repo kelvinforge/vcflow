@@ -1805,10 +1805,15 @@ pub async fn resume_work(
     registry: State<'_, RepoLockRegistry>,
 ) -> Result<ResumeOutcome, String> {
     let log = saved_work_log().ok_or("saved-work log unavailable")?;
-    let rec = log.get(id).map_err(|e| e.to_string())?.ok_or("no such saved work")?;
-    if rec.status != "saved" {
-        return Err(format!("saved work {id} is {} -- only a 'saved' entry can be resumed", rec.status));
-    }
+    // Atomic claim closes the TOCTOU between this check and this command's
+    // own status write -- see `SavedWorkLog::try_claim`. A racing second
+    // `resume_work`/`discard_work` call on the same id (a double-click, or
+    // resume-then-discard fired before the first lands) gets a clean error
+    // here instead of both passing a plain read-then-check.
+    let rec = log
+        .try_claim(id, &["saved"])
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("saved work {id} is not resumable right now"))?;
 
     // `Ok(Ok(()))` = restored, `Ok(Err(files))` = conflict (not a lock error),
     // `Err(_)` = a real error (discover failed, or a non-Conflict restore
@@ -1823,7 +1828,16 @@ pub async fn resume_work(
             Err(e) => Err(e.to_string()),
         }
     })
-    .await?;
+    .await;
+
+    let restore_result = match restore_result {
+        Ok(r) => r,
+        Err(e) => {
+            // Release the claim so the entry is still resumable.
+            log.set_status(id, &rec.status).ok();
+            return Err(e);
+        }
+    };
 
     match restore_result {
         Ok(()) => {
@@ -1853,18 +1867,24 @@ pub async fn discard_work(
     registry: State<'_, RepoLockRegistry>,
 ) -> Result<RepoStatus, String> {
     let log = saved_work_log().ok_or("saved-work log unavailable")?;
-    let rec = log.get(id).map_err(|e| e.to_string())?.ok_or("no such saved work")?;
-    if rec.status != "saved" && rec.status != "conflict" {
-        return Err(format!("saved work {id} is already {}", rec.status));
-    }
-    with_repo_lock(registry.inner(), &repo_path, || {
+    // See the matching comment in `resume_work`: this claim is what actually
+    // closes the TOCTOU, not the repo lock below.
+    let rec = log
+        .try_claim(id, &["saved", "conflict"])
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("saved work {id} is not discardable right now"))?;
+    if let Err(e) = with_repo_lock(registry.inner(), &repo_path, || {
         let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
         run_git(&repo_path, "discard_work", &rec.branch, || {
             git_core::discard_work(&mut repo, &rec.stash_oid)
         })
         .map_err(|e| e.to_string())
     })
-    .await?;
+    .await
+    {
+        log.set_status(id, &rec.status).ok();
+        return Err(e);
+    }
     log.set_status(id, "discarded").ok();
     audit_best_effort(&repo_path, "discard_work", &rec.branch, None);
     build_and_emit_status(&app, &repo_path, registry.inner()).await
