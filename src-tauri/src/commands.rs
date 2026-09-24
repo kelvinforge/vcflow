@@ -1,5 +1,5 @@
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
 
 use auth_core::{
     AuditEntry, AuditLog, Capability, CommandLog, Config, ConflictLog, OverrideRole, RoleOverride,
@@ -18,6 +18,7 @@ use workflow_engine::{
 };
 
 use crate::events::WORKFLOW_STATE_CHANGED;
+use crate::repo_lock::{try_with_repo_lock, with_repo_lock, RepoLockRegistry};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoStatus {
@@ -102,8 +103,11 @@ pub struct HotfixStatus {
 /// (that flow lands in Phase 5) -- this command's job is to prove the
 /// wiring, not to be the final production status check.
 #[tauri::command]
-pub async fn get_repo_status(repo_path: String) -> Result<RepoStatus, String> {
-    build_status(&repo_path).await
+pub async fn get_repo_status(
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<RepoStatus, String> {
+    build_status(&repo_path, registry.inner()).await
 }
 
 /// Refresh = `git fetch origin` (remote-tracking refs only, never the working
@@ -117,11 +121,21 @@ pub async fn get_repo_status(repo_path: String) -> Result<RepoStatus, String> {
 /// mutation, so the frontend re-reads the workflow snapshot on its own
 /// schedule. `get_repo_status` is the no-fetch sibling.
 #[tauri::command]
-pub async fn refresh_repo_status(repo_path: String) -> Result<RepoStatus, String> {
-    if let Ok(repo) = Repository::discover(&repo_path) {
-        let _ = git_core::fetch_origin(&repo);
-    }
-    build_status(&repo_path).await
+pub async fn refresh_repo_status(
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<RepoStatus, String> {
+    // `fetch_origin` mutates remote-tracking refs, so it runs inside the repo
+    // lock. Best-effort exactly as before: a busy lock or a fetch failure
+    // both just fall through to rebuilding status from whatever is local.
+    let _ = try_with_repo_lock(registry.inner(), &repo_path, || {
+        if let Ok(repo) = Repository::discover(&repo_path) {
+            let _ = git_core::fetch_origin(&repo);
+        }
+        Ok::<(), String>(())
+    })
+    .await;
+    build_status(&repo_path, registry.inner()).await
 }
 
 // --- Repository preflight (eligibility gate) + Initial Workflow Setup --------
@@ -239,25 +253,67 @@ fn preflight_dto(pf: git_core::Preflight) -> PreflightDto {
 /// never mutates the repository. A missing `develop` and a dirty tree are NOT
 /// failures here -- those are handled by `initialize_workflow`.
 #[tauri::command]
-pub async fn repository_preflight(repo_path: String) -> Result<PreflightDto, String> {
+pub async fn repository_preflight(
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<PreflightDto, String> {
+    repository_preflight_inner(&repo_path, registry.inner()).await
+}
+
+/// `State`-free core of `repository_preflight`, so it is directly testable
+/// and so other commands (`initialize_workflow`, `get_setup_state`) can call
+/// it with a plain `&RepoLockRegistry` instead of threading a `State`
+/// through, which only a live Tauri invocation can construct.
+async fn repository_preflight_inner(
+    repo_path: &str,
+    registry: &RepoLockRegistry,
+) -> Result<PreflightDto, String> {
     let git_version = detect_git_version();
-    let repo = Repository::discover(&repo_path).ok();
 
-    let remote_url = repo.as_ref().and_then(|r| {
-        r.find_remote("origin").ok().and_then(|rm| rm.url().map(str::to_string))
-    });
+    // "Not a repository" is a normal state this gate itself reports (checks
+    // #2/#6/#7) -- there is nothing to lock when there is no repository, so
+    // this tolerates it exactly as the old `.ok()` discover did, without
+    // going through the registry at all.
+    if Repository::discover(repo_path).is_err() {
+        let pf = git_core::assemble_preflight(git_version, None, None, None);
+        return Ok(preflight_dto(pf));
+    }
 
+    // Segment 1 (locked): just read the remote URL -- the only fact the
+    // network step below needs.
+    let remote_url = try_with_repo_lock(registry, repo_path, || {
+        let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
+        Ok::<_, String>(
+            repo.find_remote("origin").ok().and_then(|rm| rm.url().map(str::to_string)),
+        )
+    })
+    .await?
+    .ok_or("repository is busy with another operation -- try again")?;
+
+    // Unlocked: provider classification needs the network (`.await`), so it
+    // cannot run inside the lock's synchronous closure.
     let provider = match remote_url.as_deref() {
         Some(url) => Some(classify_preflight_provider(url).await),
         None => None,
     };
 
-    let remote_conn = match (repo.as_ref(), remote_url.is_some()) {
-        (Some(r), true) => Some(git_core::validate_remote_connection(r)),
-        _ => None,
-    };
+    // Segment 2 (locked): the SSH connectivity probe is a blocking call, not
+    // `.await`, so it belongs back inside the lock alongside the final
+    // repository reads `assemble_preflight` itself performs.
+    let pf = try_with_repo_lock(registry, repo_path, || {
+        let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
+        let remote_conn =
+            remote_url.is_some().then(|| git_core::validate_remote_connection(&repo));
+        Ok::<_, String>(git_core::assemble_preflight(
+            git_version.clone(),
+            Some(&repo),
+            provider,
+            remote_conn,
+        ))
+    })
+    .await?
+    .ok_or("repository is busy with another operation -- try again")?;
 
-    let pf = git_core::assemble_preflight(git_version, repo.as_ref(), provider, remote_conn);
     Ok(preflight_dto(pf))
 }
 
@@ -318,8 +374,12 @@ fn ensure_develop(
 pub async fn initialize_workflow(
     app: AppHandle,
     repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<WorkflowInitDto, String> {
-    let pf = repository_preflight(repo_path.clone()).await?;
+    // Preflight is read-only eligibility checking -- it goes through its own
+    // (try_lock) reads internally and is intentionally NOT held under the
+    // blocking mutation lock acquired below.
+    let pf = repository_preflight(repo_path.clone(), registry.clone()).await?;
     if !pf.eligible {
         let reason = pf
             .checks
@@ -339,10 +399,16 @@ pub async fn initialize_workflow(
             .emit(crate::events::WORKFLOW_INIT_STEP, serde_json::json!({ "step": step }));
     };
 
-    let out = initialize_workflow_inner(&repo_path, &emit)?;
+    // The whole mutation -- discover, guard, stash, ensure_develop (incl. its
+    // push), checkout, create feature/initial, restore -- is one critical
+    // section. `initialize_workflow_inner` is already synchronous and
+    // self-contained, so it runs directly as the lock's closure.
+    let out =
+        with_repo_lock(registry.inner(), &repo_path, || initialize_workflow_inner(&repo_path, &emit))
+            .await?;
 
     audit_best_effort(&repo_path, "initialize_workflow", &out.final_branch, None);
-    let _ = build_and_emit_status(&app, &repo_path).await;
+    let _ = build_and_emit_status(&app, &repo_path, registry.inner()).await;
     Ok(out)
 }
 
@@ -498,8 +564,23 @@ pub struct SetupStateDto {
 /// the frontend calls it on directory change, mount, after `initialize_workflow`,
 /// and on `workflow:state:changed`.
 #[tauri::command]
-pub async fn get_setup_state(repo_path: String) -> Result<SetupStateDto, String> {
-    let pf = repository_preflight(repo_path.clone()).await?;
+pub async fn get_setup_state(
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<SetupStateDto, String> {
+    get_setup_state_inner(&repo_path, registry.inner()).await
+}
+
+/// `State`-free core of `get_setup_state`, directly testable.
+async fn get_setup_state_inner(
+    repo_path: &str,
+    registry: &RepoLockRegistry,
+) -> Result<SetupStateDto, String> {
+    // `repository_preflight_inner` acquires and releases its own (try_lock)
+    // reads internally before returning -- calling it here is a separate,
+    // sequential acquisition, never a nested one, so there is no
+    // self-deadlock risk against the try_with_repo_lock call below.
+    let pf = repository_preflight_inner(repo_path, registry).await?;
 
     let mut dto = SetupStateDto {
         phase: "ready".to_string(),
@@ -523,11 +604,23 @@ pub async fn get_setup_state(repo_path: String) -> Result<SetupStateDto, String>
         return Ok(dto);
     }
 
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+    // Preflight already confirmed a real, readable repository exists at this
+    // point, so this is an ordinary locked read, not the "not a repository
+    // yet" tolerant case.
+    let (develop, dirty) = try_with_repo_lock(registry, repo_path, || {
+        let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
+        let develop = develop_exists(&repo);
+        let dirty = git_core::read_repository_state(&repo)
+            .map(|s| s.working_tree.is_dirty())
+            .unwrap_or(false);
+        Ok::<_, String>((develop, dirty))
+    })
+    .await?
+    .ok_or("repository is busy with another operation -- try again")?;
 
-    if develop_exists(&repo) {
+    if develop {
         let init_related: Vec<SavedWorkDto> = saved_work_log()
-            .and_then(|l| l.actionable_entries(&repo_path).ok())
+            .and_then(|l| l.actionable_entries(repo_path).ok())
             .unwrap_or_default()
             .into_iter()
             .filter(|r| {
@@ -547,9 +640,7 @@ pub async fn get_setup_state(repo_path: String) -> Result<SetupStateDto, String>
 
     // Preflight ok, >=1 commit, no develop -> Initial Workflow needed.
     dto.phase = "needs_initial_workflow".to_string();
-    dto.dirty = git_core::read_repository_state(&repo)
-        .map(|s| s.working_tree.is_dirty())
-        .unwrap_or(false);
+    dto.dirty = dirty;
     Ok(dto)
 }
 
@@ -609,34 +700,40 @@ pub async fn create_work_item(
     repo_path: String,
     kind: String,
     slug: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<RepoStatus, String> {
+    // Role resolution is a network read, not a repository touch -- stays
+    // outside the lock.
     let role = resolve_workflow_role(&repo_path).await;
     workflow_engine::transition(WorkItemState::NotStarted, AllowedAction::StartDevelopment, role)
         .map_err(|e| e.to_string())?;
 
     let branch_kind = parse_branch_kind(&kind)?;
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    guard_working_tree(&repo_path, &mut repo, &format!("creating {kind}/{slug}"))?;
+    let branch_name = with_repo_lock(registry.inner(), &repo_path, || {
+        let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        guard_working_tree(&repo_path, &mut repo, &format!("creating {kind}/{slug}"))?;
 
-    // Bring local `develop` current before branching off it. Fetch is
-    // best-effort; a real divergence is a hard STOP (Work Safe -- never
-    // reconciled for the user).
-    let _ = git_core::fetch_origin(&repo);
-    run_git(&repo_path, "fast_forward", "develop", || {
-        git_core::fast_forward_from_origin(&repo, "develop")
-    })
-    .map_err(|e| e.to_string())?;
+        // Bring local `develop` current before branching off it. Fetch is
+        // best-effort; a real divergence is a hard STOP (Work Safe -- never
+        // reconciled for the user).
+        let _ = git_core::fetch_origin(&repo);
+        run_git(&repo_path, "fast_forward", "develop", || {
+            git_core::fast_forward_from_origin(&repo, "develop")
+        })
+        .map_err(|e| e.to_string())?;
 
-    let branch_name = run_git(&repo_path, "create_branch", &format!("{kind}/{slug} off develop"), || {
-        git_core::create_work_branch(&repo, branch_kind, &slug, "develop")
+        run_git(&repo_path, "create_branch", &format!("{kind}/{slug} off develop"), || {
+            git_core::create_work_branch(&repo, branch_kind, &slug, "develop")
+        })
+        .map_err(|e| e.to_string())
     })
-    .map_err(|e| e.to_string())?;
+    .await?;
 
     if let Some(log) = wip_item_log() {
         log.start(&repo_path, &branch_name, &kind).ok();
     }
     audit_best_effort(&repo_path, "create_work_item", &branch_name, None);
-    build_and_emit_status(&app, &repo_path).await
+    build_and_emit_status(&app, &repo_path, registry.inner()).await
 }
 
 /// Outcome of `move_changes_to_new_branch`: the fresh status on the new branch
@@ -692,11 +789,14 @@ pub async fn move_changes_to_new_branch(
     repo_path: String,
     kind: String,
     slug: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<MoveChangesOutcome, String> {
-    let (new_branch, restore_outcome, conflicting_files) =
-        move_changes_to_new_branch_inner(&repo_path, &kind, &slug)?;
+    let (new_branch, restore_outcome, conflicting_files) = with_repo_lock(registry.inner(), &repo_path, || {
+        move_changes_to_new_branch_inner(&repo_path, &kind, &slug)
+    })
+    .await?;
     audit_best_effort(&repo_path, "move_changes_to_new_branch", &new_branch, None);
-    let status = build_and_emit_status(&app, &repo_path).await?;
+    let status = build_and_emit_status(&app, &repo_path, registry.inner()).await?;
     Ok(MoveChangesOutcome { status, new_branch, restore_outcome, conflicting_files })
 }
 
@@ -768,35 +868,48 @@ pub async fn commit_work_item(
     app: AppHandle,
     repo_path: String,
     message: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<RepoStatus, String> {
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    reject_protected_branch(&repo, "commit")?;
-    run_git(&repo_path, "commit", &message, || git_core::commit_all(&repo, &message))
-        .map_err(|e| e.to_string())?;
+    with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        reject_protected_branch(&repo, "commit")?;
+        run_git(&repo_path, "commit", &message, || git_core::commit_all(&repo, &message))
+            .map_err(|e| e.to_string())
+    })
+    .await?;
 
     audit_best_effort(&repo_path, "commit_work_item", "", None);
-    build_and_emit_status(&app, &repo_path).await
+    build_and_emit_status(&app, &repo_path, registry.inner()).await
 }
 
 /// Pushes the current branch to `origin`. Never pushes anything but the
 /// current `feature/*`/`bug/*`/`chore/*` branch.
 #[tauri::command]
-pub async fn push_work_item(app: AppHandle, repo_path: String) -> Result<RepoStatus, String> {
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    reject_protected_branch(&repo, "push")?;
-    let branch = current_branch(&repo)?;
-    run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch)).map_err(|e| e.to_string())?;
+pub async fn push_work_item(
+    app: AppHandle,
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<RepoStatus, String> {
+    let branch = with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        reject_protected_branch(&repo, "push")?;
+        let branch = current_branch(&repo)?;
+        run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch))
+            .map_err(|e| e.to_string())?;
+
+        // This runs only for follow-up commits onto an already-open MR (the
+        // Push next-action). The MR now has everything -- park the user back
+        // on develop. Best-effort -- see finish_work_item.
+        let _ = run_git(&repo_path, "checkout", "develop", || {
+            git_core::checkout_branch(&repo, "develop")
+        });
+        Ok::<_, String>(branch)
+    })
+    .await?;
 
     audit_best_effort(&repo_path, "push_work_item", &branch, None);
 
-    // This runs only for follow-up commits onto an already-open MR (the Push
-    // next-action). The MR now has everything -- park the user back on develop.
-    // Best-effort -- see finish_work_item.
-    let _ = run_git(&repo_path, "checkout", "develop", || {
-        git_core::checkout_branch(&repo, "develop")
-    });
-
-    build_and_emit_status(&app, &repo_path).await
+    build_and_emit_status(&app, &repo_path, registry.inner()).await
 }
 
 /// Member-only: pushes the current branch (in case of uncommitted pushes)
@@ -807,23 +920,27 @@ pub async fn finish_work_item(
     app: AppHandle,
     repo_path: String,
     title: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<RepoStatus, String> {
     let role = resolve_workflow_role(&repo_path).await;
     workflow_engine::transition(WorkItemState::Developing, AllowedAction::Finish, role)
         .map_err(|e| e.to_string())?;
 
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let branch = current_branch(&repo)?;
-    run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch)).map_err(|e| e.to_string())?;
+    // Segment 1 (locked): push, then read what the provider call needs.
+    let (branch, remote_url) = with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let branch = current_branch(&repo)?;
+        run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch))
+            .map_err(|e| e.to_string())?;
+        let remote_url = repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+        Ok::<_, String>((branch, remote_url))
+    })
+    .await?;
 
-    let remote_url = repo
-        .find_remote("origin")
-        .ok()
-        .and_then(|r| r.url().map(str::to_string));
+    // Unlocked: the provider REST call.
     let client = provider_client_for(&remote_url)
         .await
         .ok_or("could not reach the provider API for this remote (check token/host)")?;
-
     let mr = client
         .create_merge_request(&branch, "develop", &title)
         .await
@@ -837,23 +954,40 @@ pub async fn finish_work_item(
     }
     audit_best_effort(&repo_path, "finish_work_item", &branch, Some(&mr.id));
 
-    // MR is open; nothing more to do on the work branch. Park the user back on
-    // develop. Best-effort: the tree is clean here (Finish is only offered when
-    // committed) and the checkout is safe, but a missing local develop must not
-    // fail a finish whose MR already succeeded.
-    let _ = run_git(&repo_path, "checkout", "develop", || {
-        git_core::checkout_branch(&repo, "develop")
-    });
+    // Segment 2 (locked again): MR is open; nothing more to do on the work
+    // branch. Park the user back on develop. Best-effort: the tree is clean
+    // here (Finish is only offered when committed) and the checkout is safe,
+    // but a missing local develop must not fail a finish whose MR already
+    // succeeded.
+    let _ = with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let _ = run_git(&repo_path, "checkout", "develop", || {
+            git_core::checkout_branch(&repo, "develop")
+        });
+        Ok::<_, String>(())
+    })
+    .await;
 
-    build_and_emit_status(&app, &repo_path).await
+    build_and_emit_status(&app, &repo_path, registry.inner()).await
 }
 
 /// Read-only: polls the provider for the MR opened on the current branch,
 /// if any. No role gate -- viewing status is never Owner-only.
 #[tauri::command]
-pub async fn get_mr_status(repo_path: String) -> Result<Option<MrStatus>, String> {
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let branch = current_branch(&repo)?;
+pub async fn get_mr_status(
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<Option<MrStatus>, String> {
+    let Some((branch, remote_url)) = try_with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let branch = current_branch(&repo)?;
+        let remote_url = repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+        Ok::<_, String>((branch, remote_url))
+    })
+    .await?
+    else {
+        return Ok(None); // repository busy with another operation -- skip this poll
+    };
 
     let Some(mr_ref) = work_item_log()
         .and_then(|log| log.mrs_for_branch(&repo_path, &branch).ok())
@@ -864,10 +998,6 @@ pub async fn get_mr_status(repo_path: String) -> Result<Option<MrStatus>, String
         return Ok(None);
     };
 
-    let remote_url = repo
-        .find_remote("origin")
-        .ok()
-        .and_then(|r| r.url().map(str::to_string));
     let Some(client) = provider_client_for(&remote_url).await else {
         return Ok(None);
     };
@@ -882,30 +1012,34 @@ pub async fn create_hotfix(
     app: AppHandle,
     repo_path: String,
     slug: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<RepoStatusWithPath, String> {
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let production = resolve_production(&repo)?;
-    guard_working_tree(&repo_path, &mut repo, &format!("creating hotfix/{slug}"))?;
+    let branch_name = with_repo_lock(registry.inner(), &repo_path, || {
+        let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let production = resolve_production(&repo)?;
+        guard_working_tree(&repo_path, &mut repo, &format!("creating hotfix/{slug}"))?;
 
-    // Bring the local production branch current before branching off it. Fetch
-    // is best-effort; a real divergence is a hard STOP (Work Safe -- never
-    // reconciled for the user).
-    let _ = git_core::fetch_origin(&repo);
-    run_git(&repo_path, "fast_forward", &production, || {
-        git_core::fast_forward_from_origin(&repo, &production)
-    })
-    .map_err(|e| e.to_string())?;
+        // Bring the local production branch current before branching off it.
+        // Fetch is best-effort; a real divergence is a hard STOP (Work Safe
+        // -- never reconciled for the user).
+        let _ = git_core::fetch_origin(&repo);
+        run_git(&repo_path, "fast_forward", &production, || {
+            git_core::fast_forward_from_origin(&repo, &production)
+        })
+        .map_err(|e| e.to_string())?;
 
-    let branch_name = run_git(&repo_path, "create_hotfix_branch", &slug, || {
-        git_core::create_hotfix_branch(&repo, &slug, &production)
+        run_git(&repo_path, "create_hotfix_branch", &slug, || {
+            git_core::create_hotfix_branch(&repo, &slug, &production)
+        })
+        .map_err(|e| e.to_string())
     })
-    .map_err(|e| e.to_string())?;
+    .await?;
 
     if let Some(log) = wip_item_log() {
         log.start(&repo_path, &branch_name, "hotfix").ok();
     }
     audit_best_effort(&repo_path, "create_hotfix", &branch_name, None);
-    let status = build_and_emit_status(&app, &repo_path).await?;
+    let status = build_and_emit_status(&app, &repo_path, registry.inner()).await?;
     Ok(RepoStatusWithPath { status, repo_path })
 }
 
@@ -918,20 +1052,24 @@ pub async fn finish_hotfix(
     app: AppHandle,
     repo_path: String,
     title: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<RepoStatusWithPath, String> {
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let production = resolve_production(&repo)?;
-    let branch = current_branch(&repo)?;
-    run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch)).map_err(|e| e.to_string())?;
+    // Segment 1 (locked): push, then read what the provider calls need.
+    let (production, branch, remote_url) = with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let production = resolve_production(&repo)?;
+        let branch = current_branch(&repo)?;
+        run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch))
+            .map_err(|e| e.to_string())?;
+        let remote_url = repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+        Ok::<_, String>((production, branch, remote_url))
+    })
+    .await?;
 
-    let remote_url = repo
-        .find_remote("origin")
-        .ok()
-        .and_then(|r| r.url().map(str::to_string));
+    // Unlocked: two provider REST calls.
     let client = provider_client_for(&remote_url)
         .await
         .ok_or("could not reach the provider API for this remote (check token/host)")?;
-
     let prod_mr = client
         .create_merge_request(&branch, &production, &title)
         .await
@@ -951,21 +1089,39 @@ pub async fn finish_hotfix(
     audit_best_effort(&repo_path, "finish_hotfix", &branch, Some(&prod_mr.id));
     audit_best_effort(&repo_path, "finish_hotfix", &branch, Some(&sync_mr.id));
 
-    // Both MRs are open; park the user back on develop. Best-effort -- see
-    // finish_work_item.
-    let _ = run_git(&repo_path, "checkout", "develop", || {
-        git_core::checkout_branch(&repo, "develop")
-    });
+    // Segment 2 (locked again): both MRs are open; park the user back on
+    // develop. Best-effort -- see finish_work_item.
+    let _ = with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let _ = run_git(&repo_path, "checkout", "develop", || {
+            git_core::checkout_branch(&repo, "develop")
+        });
+        Ok::<_, String>(())
+    })
+    .await;
 
-    let status = build_and_emit_status(&app, &repo_path).await?;
+    let status = build_and_emit_status(&app, &repo_path, registry.inner()).await?;
     Ok(RepoStatusWithPath { status, repo_path })
 }
 
 /// Read-only: polls both MRs of the current hotfix branch, if any.
 #[tauri::command]
-pub async fn get_hotfix_status(repo_path: String) -> Result<Option<HotfixStatus>, String> {
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let branch = current_branch(&repo)?;
+pub async fn get_hotfix_status(
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<Option<HotfixStatus>, String> {
+    let Some((branch, remote_url, production)) =
+        try_with_repo_lock(registry.inner(), &repo_path, || {
+            let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+            let branch = current_branch(&repo)?;
+            let remote_url = repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+            let production = resolve_production(&repo)?;
+            Ok::<_, String>((branch, remote_url, production))
+        })
+        .await?
+    else {
+        return Ok(None); // repository busy with another operation -- skip this poll
+    };
 
     let mrs = work_item_log()
         .and_then(|log| log.mrs_for_branch(&repo_path, &branch).ok())
@@ -974,15 +1130,10 @@ pub async fn get_hotfix_status(repo_path: String) -> Result<Option<HotfixStatus>
         return Ok(None);
     }
 
-    let remote_url = repo
-        .find_remote("origin")
-        .ok()
-        .and_then(|r| r.url().map(str::to_string));
     let Some(client) = provider_client_for(&remote_url).await else {
         return Ok(None);
     };
 
-    let production = resolve_production(&repo)?;
     let mut master = None;
     let mut develop = None;
     for mr_ref in mrs {
@@ -1024,35 +1175,57 @@ pub struct NextActionDto {
 /// Best-effort throughout -- an unreadable repo errors, but an unreachable
 /// provider or missing token just yields a safe-looking snapshot.
 #[tauri::command]
-pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String> {
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let branch = current_branch(&repo)?;
-    let class = classify_branch(&branch);
+pub async fn get_next_action(
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<NextActionDto, String> {
+    let (branch, class, dirty, in_progress_op, ahead, behind, diverged, primary_target, remote_url) =
+        try_with_repo_lock(registry.inner(), &repo_path, || {
+            let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+            let branch = current_branch(&repo)?;
+            let class = classify_branch(&branch);
 
-    let (dirty, in_progress_op, ahead, behind, diverged) =
-        match git_core::read_repository_state(&repo).ok() {
-            Some(s) => {
-                let up = s.upstream.unwrap_or_default();
-                (
-                    s.working_tree.is_dirty(),
-                    s.in_progress_op.map(|o| o.label().to_string()),
-                    up.ahead,
-                    up.behind,
-                    up.is_diverged(),
-                )
-            }
-            None => (false, None, 0, 0, false),
-        };
+            let (dirty, in_progress_op, ahead, behind, diverged) =
+                match git_core::read_repository_state(&repo).ok() {
+                    Some(s) => {
+                        let up = s.upstream.unwrap_or_default();
+                        (
+                            s.working_tree.is_dirty(),
+                            s.in_progress_op.map(|o| o.label().to_string()),
+                            up.ahead,
+                            up.behind,
+                            up.is_diverged(),
+                        )
+                    }
+                    None => (false, None, 0, 0, false),
+                };
+
+            // A work item's MR targets develop; a hotfix's primary MR
+            // targets the production branch (main/master).
+            let primary_target = if class == BranchClass::Hotfix || class == BranchClass::Release {
+                resolve_production(&repo)?
+            } else {
+                "develop".to_string()
+            };
+            let remote_url = repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+
+            Ok::<_, String>((
+                branch,
+                class,
+                dirty,
+                in_progress_op,
+                ahead,
+                behind,
+                diverged,
+                primary_target,
+                remote_url,
+            ))
+        })
+        .await?
+        .ok_or("repository is busy with another operation -- try again")?;
 
     let role = resolve_workflow_role(&repo_path).await;
 
-    // A work item's MR targets develop; a hotfix's primary MR targets the
-    // production branch (main/master).
-    let primary_target = if class == BranchClass::Hotfix || class == BranchClass::Release {
-        resolve_production(&repo)?
-    } else {
-        "develop".to_string()
-    };
     let tracked_mr = work_item_log()
         .and_then(|log| log.mrs_for_branch(&repo_path, &branch).ok())
         .unwrap_or_default()
@@ -1060,16 +1233,10 @@ pub async fn get_next_action(repo_path: String) -> Result<NextActionDto, String>
         .find(|m| m.target_branch == primary_target);
 
     let mr = match &tracked_mr {
-        Some(m) => {
-            let remote_url = repo
-                .find_remote("origin")
-                .ok()
-                .and_then(|r| r.url().map(str::to_string));
-            match provider_client_for(&remote_url).await {
-                Some(client) => mr_snapshot(&client, &m.mr_iid).await,
-                None => None,
-            }
-        }
+        Some(m) => match provider_client_for(&remote_url).await {
+            Some(client) => mr_snapshot(&client, &m.mr_iid).await,
+            None => None,
+        },
         None => None,
     };
 
@@ -1186,7 +1353,7 @@ async fn mr_snapshot(client: &ApiClient, mr_iid: &str) -> Option<MrSnapshot> {
 /// (`get_repo_status`, `refresh_repo_status`) so a periodic poll never emits
 /// `workflow:state:changed` -- that event means "a mutation happened, re-read
 /// the workflow snapshot", and a poll is not a mutation.
-async fn build_status(repo_path: &str) -> Result<RepoStatus, String> {
+async fn build_status(repo_path: &str, registry: &RepoLockRegistry) -> Result<RepoStatus, String> {
     let info = git_core::read_repo_info(repo_path).map_err(|e| e.to_string())?;
 
     let mut provider = info
@@ -1252,15 +1419,23 @@ async fn build_status(repo_path: &str) -> Result<RepoStatus, String> {
     let role = resolve_role_best_effort(&user, &repository_key, provider_role, &config);
 
     // Work Safe read-only state -- best-effort; a repo we can't inspect
-    // (detached HEAD, unreadable) just reports the safe-looking default.
-    let repo_handle = Repository::discover(repo_path).ok();
-    let production_branch = repo_handle
-        .as_ref()
-        .and_then(git_core::production_branch)
-        .unwrap_or_else(|| "main".to_string());
-    let ws = repo_handle
-        .as_ref()
-        .and_then(|repo| git_core::read_repository_state(repo).ok());
+    // (detached HEAD, unreadable), or a repo lock currently held by an
+    // in-flight mutation elsewhere, both report the same safe-looking
+    // default that an unreadable repo already reported before this lock
+    // existed -- `try_with_repo_lock` folds "busy" and "unreadable" the same
+    // way `.ok()` already did.
+    let ws_read = try_with_repo_lock(registry, repo_path, || {
+        let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
+        let production_branch = git_core::production_branch(&repo);
+        let state = git_core::read_repository_state(&repo).ok();
+        Ok::<_, String>((production_branch, state))
+    })
+    .await
+    .unwrap_or(None);
+    let (production_branch, ws) = match ws_read {
+        Some((pb, state)) => (pb.unwrap_or_else(|| "main".to_string()), state),
+        None => ("main".to_string(), None),
+    };
     let (dirty, dirty_count, in_progress_op, ahead, behind, diverged) = match ws {
         Some(s) => {
             let up = s.upstream.unwrap_or_default();
@@ -1302,8 +1477,12 @@ async fn build_status(repo_path: &str) -> Result<RepoStatus, String> {
 
 /// Build `RepoStatus` and broadcast `workflow:state:changed`. Mutating
 /// commands call this at their tail so the frontend re-reads the snapshot.
-async fn build_and_emit_status(app: &AppHandle, repo_path: &str) -> Result<RepoStatus, String> {
-    let status = build_status(repo_path).await?;
+async fn build_and_emit_status(
+    app: &AppHandle,
+    repo_path: &str,
+    registry: &RepoLockRegistry,
+) -> Result<RepoStatus, String> {
+    let status = build_status(repo_path, registry).await?;
     app.emit(WORKFLOW_STATE_CHANGED, &status)
         .map_err(|e| e.to_string())?;
     Ok(status)
@@ -1574,19 +1753,27 @@ pub struct ResumeOutcome {
 /// Work Safe: manually stash the current working tree (tracked + untracked)
 /// as a resumable Saved Work entry. Errors if the tree is already clean.
 #[tauri::command]
-pub async fn save_work(app: AppHandle, repo_path: String) -> Result<RepoStatus, String> {
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let branch = current_branch(&repo)?;
-    let original_commit = head_commit_oid(&repo);
-    let label = format!("manual save on {branch}");
-    let saved = run_git(&repo_path, "save_work", &branch, || git_core::save_work(&mut repo, &label))
-        .map_err(|e| e.to_string())?
-        .ok_or("nothing to save -- working tree is clean")?;
-    if let Some(log) = saved_work_log() {
-        log.record(&repo_path, &branch, &saved.stash_oid, &label, &original_commit).ok();
-    }
+pub async fn save_work(
+    app: AppHandle,
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<RepoStatus, String> {
+    let branch = with_repo_lock(registry.inner(), &repo_path, || {
+        let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let branch = current_branch(&repo)?;
+        let original_commit = head_commit_oid(&repo);
+        let label = format!("manual save on {branch}");
+        let saved = run_git(&repo_path, "save_work", &branch, || git_core::save_work(&mut repo, &label))
+            .map_err(|e| e.to_string())?
+            .ok_or("nothing to save -- working tree is clean")?;
+        if let Some(log) = saved_work_log() {
+            log.record(&repo_path, &branch, &saved.stash_oid, &label, &original_commit).ok();
+        }
+        Ok::<_, String>(branch)
+    })
+    .await?;
     audit_best_effort(&repo_path, "save_work", &branch, None);
-    build_and_emit_status(&app, &repo_path).await
+    build_and_emit_status(&app, &repo_path, registry.inner()).await
 }
 
 /// Work Safe: Saved Work entries the frontend should surface for this repo,
@@ -1611,30 +1798,46 @@ pub fn list_saved_work(repo_path: String) -> Result<Vec<SavedWorkDto>, String> {
 /// directory holds the conflict markers, and `outcome` is `"conflict"` -- no
 /// reset, no discard, no automatic resolution.
 #[tauri::command]
-pub async fn resume_work(app: AppHandle, repo_path: String, id: i64) -> Result<ResumeOutcome, String> {
+pub async fn resume_work(
+    app: AppHandle,
+    repo_path: String,
+    id: i64,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<ResumeOutcome, String> {
     let log = saved_work_log().ok_or("saved-work log unavailable")?;
     let rec = log.get(id).map_err(|e| e.to_string())?.ok_or("no such saved work")?;
     if rec.status != "saved" {
         return Err(format!("saved work {id} is {} -- only a 'saved' entry can be resumed", rec.status));
     }
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
 
-    match run_git(&repo_path, "restore_work", &rec.branch, || {
-        git_core::restore_work(&mut repo, &rec.stash_oid)
-    }) {
+    // `Ok(Ok(()))` = restored, `Ok(Err(files))` = conflict (not a lock error),
+    // `Err(_)` = a real error (discover failed, or a non-Conflict restore
+    // failure).
+    let restore_result = with_repo_lock(registry.inner(), &repo_path, || {
+        let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        match run_git(&repo_path, "restore_work", &rec.branch, || {
+            git_core::restore_work(&mut repo, &rec.stash_oid)
+        }) {
+            Ok(()) => Ok(Ok(())),
+            Err(git_core::SaveWorkError::Conflict { files }) => Ok(Err(files)),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await?;
+
+    match restore_result {
         Ok(()) => {
             log.set_status(id, "restored").ok();
             audit_best_effort(&repo_path, "resume_work", &rec.branch, None);
-            let status = build_and_emit_status(&app, &repo_path).await?;
+            let status = build_and_emit_status(&app, &repo_path, registry.inner()).await?;
             Ok(ResumeOutcome { outcome: "restored".into(), conflicting_files: vec![], status })
         }
-        Err(git_core::SaveWorkError::Conflict { files }) => {
+        Err(files) => {
             log.set_status(id, "conflict").ok();
             audit_best_effort(&repo_path, "resume_work_conflict", &rec.branch, None);
-            let status = build_and_emit_status(&app, &repo_path).await?;
+            let status = build_and_emit_status(&app, &repo_path, registry.inner()).await?;
             Ok(ResumeOutcome { outcome: "conflict".into(), conflicting_files: files, status })
         }
-        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -1643,20 +1846,28 @@ pub async fn resume_work(app: AppHandle, repo_path: String, id: i64) -> Result<R
 /// for a `saved` entry or a `conflict` one (whose stash git kept after a
 /// failed resume).
 #[tauri::command]
-pub async fn discard_work(app: AppHandle, repo_path: String, id: i64) -> Result<RepoStatus, String> {
+pub async fn discard_work(
+    app: AppHandle,
+    repo_path: String,
+    id: i64,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<RepoStatus, String> {
     let log = saved_work_log().ok_or("saved-work log unavailable")?;
     let rec = log.get(id).map_err(|e| e.to_string())?.ok_or("no such saved work")?;
     if rec.status != "saved" && rec.status != "conflict" {
         return Err(format!("saved work {id} is already {}", rec.status));
     }
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    run_git(&repo_path, "discard_work", &rec.branch, || {
-        git_core::discard_work(&mut repo, &rec.stash_oid)
+    with_repo_lock(registry.inner(), &repo_path, || {
+        let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        run_git(&repo_path, "discard_work", &rec.branch, || {
+            git_core::discard_work(&mut repo, &rec.stash_oid)
+        })
+        .map_err(|e| e.to_string())
     })
-    .map_err(|e| e.to_string())?;
+    .await?;
     log.set_status(id, "discarded").ok();
     audit_best_effort(&repo_path, "discard_work", &rec.branch, None);
-    build_and_emit_status(&app, &repo_path).await
+    build_and_emit_status(&app, &repo_path, registry.inner()).await
 }
 
 // --- Work-in-progress items (branch continuation) ----------------------
@@ -1717,9 +1928,31 @@ fn branch_work_type(branch: &str) -> Option<String> {
     }
 }
 
-async fn build_work_list(repo_path: &str) -> WorkList {
-    let repo = Repository::discover(repo_path).ok();
-    let current_branch = repo.as_ref().and_then(|r| current_branch(r).ok());
+async fn build_work_list(repo_path: &str, registry: &RepoLockRegistry) -> WorkList {
+    // Tolerates "not a repository yet" exactly as the old `.ok()` discover
+    // did -- nothing to lock in that case. When a repository exists, the
+    // handful of facts this function needs from it are read under the lock;
+    // a busy lock just falls back to the same defaults an unreadable repo
+    // already produced.
+    let repo_facts = if Repository::discover(repo_path).is_ok() {
+        try_with_repo_lock(registry, repo_path, || {
+            let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
+            let current_branch = current_branch(&repo).ok();
+            let remote_url =
+                repo.find_remote("origin").ok().and_then(|rm| rm.url().map(str::to_string));
+            let production = git_core::production_branch(&repo);
+            Ok::<_, String>((current_branch, remote_url, production))
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    let (current_branch, remote_url, production) = match repo_facts {
+        Some((cb, ru, p)) => (cb, ru, p.unwrap_or_else(|| "master".to_string())),
+        None => (None, None, "master".to_string()),
+    };
 
     // Self-heal: branches that predate wip_items (never went through
     // `create_work_item` in-app) still surface. `backfill` only inserts when
@@ -1742,13 +1975,6 @@ async fn build_work_list(repo_path: &str) -> WorkList {
     // Reconcile handed-off items: an MR merged on the web sends us no signal,
     // so poll each `waiting` item's MR and retire it when merged. Best-effort
     // -- offline or no token just leaves it under "Waiting Work".
-    let remote_url = repo.as_ref().and_then(|r| {
-        r.find_remote("origin").ok().and_then(|rm| rm.url().map(str::to_string))
-    });
-    let production = repo
-        .as_ref()
-        .and_then(git_core::production_branch)
-        .unwrap_or_else(|| "master".to_string());
     if let Some(client) = provider_client_for(&remote_url).await {
         let waiting: Vec<(String, String)> = wip_item_log()
             .and_then(|l| l.actionable(repo_path).ok())
@@ -1817,8 +2043,11 @@ async fn build_work_list(repo_path: &str) -> WorkList {
 
 /// Read-only: the user's unfinished / handed-off work in this repo.
 #[tauri::command]
-pub async fn list_work_items(repo_path: String) -> Result<WorkList, String> {
-    Ok(build_work_list(&repo_path).await)
+pub async fn list_work_items(
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<WorkList, String> {
+    Ok(build_work_list(&repo_path, registry.inner()).await)
 }
 
 /// Come back to a tracked branch: Work Safe guard (stash anything dirty on the
@@ -1830,6 +2059,7 @@ pub async fn continue_work(
     app: AppHandle,
     repo_path: String,
     work_item_id: i64,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<ContinueOutcome, String> {
     let log = wip_item_log().ok_or("work-item log unavailable")?;
     let item = log.get(work_item_id).map_err(|e| e.to_string())?.ok_or("no such work item")?;
@@ -1840,45 +2070,52 @@ pub async fn continue_work(
         return Err(format!("work item is {} -- nothing to continue", item.status));
     }
 
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    guard_working_tree(&repo_path, &mut repo, &format!("continuing {}", item.branch))?;
+    let (saved_rec, restore_outcome, conflicting_files) =
+        with_repo_lock(registry.inner(), &repo_path, || {
+            let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+            guard_working_tree(&repo_path, &mut repo, &format!("continuing {}", item.branch))?;
 
-    run_git(&repo_path, "checkout", &item.branch, || {
-        git_core::checkout_branch(&repo, &item.branch)
-    })
-    .map_err(|e| e.to_string())?;
-    audit_best_effort(&repo_path, "continue_work", &item.branch, None);
+            run_git(&repo_path, "checkout", &item.branch, || {
+                git_core::checkout_branch(&repo, &item.branch)
+            })
+            .map_err(|e| e.to_string())?;
+            audit_best_effort(&repo_path, "continue_work", &item.branch, None);
 
-    // Auto-apply the branch's Saved Work. The tree is clean here (guard stashed
-    // whatever was dirty on the branch we just left), so this is safe.
-    let swlog = saved_work_log();
-    let saved_rec = swlog
-        .as_ref()
-        .and_then(|l| l.saved_for_branch(&repo_path, &item.branch).ok().flatten());
+            // Auto-apply the branch's Saved Work. The tree is clean here
+            // (guard stashed whatever was dirty on the branch we just left),
+            // so this is safe.
+            let swlog = saved_work_log();
+            let saved_rec = swlog
+                .as_ref()
+                .and_then(|l| l.saved_for_branch(&repo_path, &item.branch).ok().flatten());
 
-    let (restore_outcome, conflicting_files) = match (swlog.as_ref(), saved_rec.as_ref()) {
-        (Some(l), Some(rec)) => {
-            match run_git(&repo_path, "restore_work", &rec.branch, || {
-                git_core::restore_work(&mut repo, &rec.stash_oid)
-            }) {
-                Ok(()) => {
-                    l.set_status(rec.id, "restored").ok();
-                    audit_best_effort(&repo_path, "resume_work", &rec.branch, None);
-                    ("restored".to_string(), vec![])
+            let (restore_outcome, conflicting_files) = match (swlog.as_ref(), saved_rec.as_ref()) {
+                (Some(l), Some(rec)) => {
+                    match run_git(&repo_path, "restore_work", &rec.branch, || {
+                        git_core::restore_work(&mut repo, &rec.stash_oid)
+                    }) {
+                        Ok(()) => {
+                            l.set_status(rec.id, "restored").ok();
+                            audit_best_effort(&repo_path, "resume_work", &rec.branch, None);
+                            ("restored".to_string(), vec![])
+                        }
+                        Err(git_core::SaveWorkError::Conflict { files }) => {
+                            l.set_status(rec.id, "conflict").ok();
+                            audit_best_effort(&repo_path, "resume_work_conflict", &rec.branch, None);
+                            ("conflict".to_string(), files)
+                        }
+                        Err(_) => ("error".to_string(), vec![]),
+                    }
                 }
-                Err(git_core::SaveWorkError::Conflict { files }) => {
-                    l.set_status(rec.id, "conflict").ok();
-                    audit_best_effort(&repo_path, "resume_work_conflict", &rec.branch, None);
-                    ("conflict".to_string(), files)
-                }
-                Err(_) => ("error".to_string(), vec![]),
-            }
-        }
-        _ => ("none".to_string(), vec![]),
-    };
+                _ => ("none".to_string(), vec![]),
+            };
+
+            Ok::<_, String>((saved_rec, restore_outcome, conflicting_files))
+        })
+        .await?;
 
     let saved_work = saved_rec.map(saved_work_dto);
-    let status = build_and_emit_status(&app, &repo_path).await?;
+    let status = build_and_emit_status(&app, &repo_path, registry.inner()).await?;
     Ok(ContinueOutcome { status, saved_work, restore_outcome, conflicting_files })
 }
 
@@ -1911,44 +2148,51 @@ pub async fn inspect_branch(
     app: AppHandle,
     repo_path: String,
     target: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<InspectionOutcome, String> {
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let production = resolve_production(&repo)?;
-    if target != "develop" && target != production {
-        return Err(format!(
-            "branch inspection only supports 'develop' or '{production}', not '{target}'"
-        ));
-    }
-    let original_branch = current_branch(&repo)?;
-    if original_branch == target {
-        return Err(format!("already on '{target}' -- nothing to inspect"));
-    }
-    // Fail before Work Safe touches the tree if the target does not exist.
-    repo.find_branch(&target, git2::BranchType::Local)
-        .map_err(|_| format!("no local branch '{target}' to inspect"))?;
+    let (original_branch, saved_work_id) = with_repo_lock(registry.inner(), &repo_path, || {
+        let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let production = resolve_production(&repo)?;
+        if target != "develop" && target != production {
+            return Err(format!(
+                "branch inspection only supports 'develop' or '{production}', not '{target}'"
+            ));
+        }
+        let original_branch = current_branch(&repo)?;
+        if original_branch == target {
+            return Err(format!("already on '{target}' -- nothing to inspect"));
+        }
+        // Fail before Work Safe touches the tree if the target does not exist.
+        repo.find_branch(&target, git2::BranchType::Local)
+            .map_err(|_| format!("no local branch '{target}' to inspect"))?;
 
-    let saved_work_id =
-        guard_working_tree(&repo_path, &mut repo, &format!("inspecting {target}"))?;
+        let saved_work_id =
+            guard_working_tree(&repo_path, &mut repo, &format!("inspecting {target}"))?;
 
-    if let Err(e) = run_git(&repo_path, "checkout", &target, || {
-        git_core::checkout_branch(&repo, &target)
-    }) {
-        // Checkout failed after we stashed -- put the tree back so the user is
-        // left exactly where they started. Work Safe: never leave it worse.
-        if let Some(id) = saved_work_id {
-            if let Some(log) = saved_work_log() {
-                if let Ok(Some(rec)) = log.get(id) {
-                    if git_core::restore_work(&mut repo, &rec.stash_oid).is_ok() {
-                        log.set_status(id, "restored").ok();
+        if let Err(e) = run_git(&repo_path, "checkout", &target, || {
+            git_core::checkout_branch(&repo, &target)
+        }) {
+            // Checkout failed after we stashed -- put the tree back so the
+            // user is left exactly where they started. Work Safe: never
+            // leave it worse.
+            if let Some(id) = saved_work_id {
+                if let Some(log) = saved_work_log() {
+                    if let Ok(Some(rec)) = log.get(id) {
+                        if git_core::restore_work(&mut repo, &rec.stash_oid).is_ok() {
+                            log.set_status(id, "restored").ok();
+                        }
                     }
                 }
             }
+            return Err(format!("checkout '{target}' failed: {e}"));
         }
-        return Err(format!("checkout '{target}' failed: {e}"));
-    }
-    audit_best_effort(&repo_path, "inspect_branch", &target, None);
+        audit_best_effort(&repo_path, "inspect_branch", &target, None);
 
-    let status = build_and_emit_status(&app, &repo_path).await?;
+        Ok((original_branch, saved_work_id))
+    })
+    .await?;
+
+    let status = build_and_emit_status(&app, &repo_path, registry.inner()).await?;
     Ok(InspectionOutcome { status, original_branch, saved_work_id })
 }
 
@@ -1963,47 +2207,61 @@ pub async fn end_branch_inspection(
     repo_path: String,
     original_branch: String,
     saved_work_id: Option<i64>,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<ResumeOutcome, String> {
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    // The inspected branch is never written to, so it is normally clean; guard
-    // anyway in case the user edited during inspection -- Work Safe protects
-    // those edits rather than losing them to the checkout.
-    guard_working_tree(&repo_path, &mut repo, &format!("returning to {original_branch}"))?;
+    // The checkout and the (optional) restore that follows must stay one
+    // atomic unit -- exactly as the single `&mut repo` handle already implied
+    // before this lock existed -- so this is one critical section, not two.
+    // `Ok(None)` = no saved_work_id, nothing to restore; `Ok(Some(Ok(())))` =
+    // restored; `Ok(Some(Err(files)))` = conflict; `Err(_)` = a real error.
+    let restore_result = with_repo_lock(registry.inner(), &repo_path, || {
+        let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        // The inspected branch is never written to, so it is normally clean;
+        // guard anyway in case the user edited during inspection -- Work
+        // Safe protects those edits rather than losing them to the checkout.
+        guard_working_tree(&repo_path, &mut repo, &format!("returning to {original_branch}"))?;
 
-    run_git(&repo_path, "checkout", &original_branch, || {
-        git_core::checkout_branch(&repo, &original_branch)
+        run_git(&repo_path, "checkout", &original_branch, || {
+            git_core::checkout_branch(&repo, &original_branch)
+        })
+        .map_err(|e| format!("checkout '{original_branch}' failed: {e}"))?;
+        audit_best_effort(&repo_path, "end_branch_inspection", &original_branch, None);
+
+        let Some(id) = saved_work_id else {
+            return Ok(None);
+        };
+        let log = saved_work_log().ok_or("saved-work log unavailable")?;
+        let rec = log
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or("the Saved Work entry for this inspection no longer exists")?;
+
+        match run_git(&repo_path, "restore_work", &rec.branch, || {
+            git_core::restore_work(&mut repo, &rec.stash_oid)
+        }) {
+            Ok(()) => {
+                log.set_status(id, "restored").ok();
+                audit_best_effort(&repo_path, "resume_work", &rec.branch, None);
+                Ok(Some(Ok(())))
+            }
+            Err(git_core::SaveWorkError::Conflict { files }) => {
+                log.set_status(id, "conflict").ok();
+                audit_best_effort(&repo_path, "resume_work_conflict", &rec.branch, None);
+                Ok(Some(Err(files)))
+            }
+            Err(e) => Err(e.to_string()),
+        }
     })
-    .map_err(|e| format!("checkout '{original_branch}' failed: {e}"))?;
-    audit_best_effort(&repo_path, "end_branch_inspection", &original_branch, None);
+    .await?;
 
-    let Some(id) = saved_work_id else {
-        let status = build_and_emit_status(&app, &repo_path).await?;
-        return Ok(ResumeOutcome { outcome: "none".into(), conflicting_files: vec![], status });
-    };
-
-    let log = saved_work_log().ok_or("saved-work log unavailable")?;
-    let rec = log
-        .get(id)
-        .map_err(|e| e.to_string())?
-        .ok_or("the Saved Work entry for this inspection no longer exists")?;
-
-    match run_git(&repo_path, "restore_work", &rec.branch, || {
-        git_core::restore_work(&mut repo, &rec.stash_oid)
-    }) {
-        Ok(()) => {
-            log.set_status(id, "restored").ok();
-            audit_best_effort(&repo_path, "resume_work", &rec.branch, None);
-            let status = build_and_emit_status(&app, &repo_path).await?;
-            Ok(ResumeOutcome { outcome: "restored".into(), conflicting_files: vec![], status })
+    let status = build_and_emit_status(&app, &repo_path, registry.inner()).await?;
+    Ok(match restore_result {
+        None => ResumeOutcome { outcome: "none".into(), conflicting_files: vec![], status },
+        Some(Ok(())) => ResumeOutcome { outcome: "restored".into(), conflicting_files: vec![], status },
+        Some(Err(files)) => {
+            ResumeOutcome { outcome: "conflict".into(), conflicting_files: files, status }
         }
-        Err(git_core::SaveWorkError::Conflict { files }) => {
-            log.set_status(id, "conflict").ok();
-            audit_best_effort(&repo_path, "resume_work_conflict", &rec.branch, None);
-            let status = build_and_emit_status(&app, &repo_path).await?;
-            Ok(ResumeOutcome { outcome: "conflict".into(), conflicting_files: files, status })
-        }
-        Err(e) => Err(e.to_string()),
-    }
+    })
 }
 
 /// Abandon a tracked work item. V1: flips the WIP status to `dropped` only --
@@ -2014,6 +2272,7 @@ pub async fn drop_work(
     repo_path: String,
     work_item_id: i64,
     confirmation: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<WorkList, String> {
     let log = wip_item_log().ok_or("work-item log unavailable")?;
     let item = log.get(work_item_id).map_err(|e| e.to_string())?.ok_or("no such work item")?;
@@ -2025,7 +2284,7 @@ pub async fn drop_work(
     }
     log.set_status(&repo_path, &item.branch, "dropped").map_err(|e| e.to_string())?;
     audit_best_effort(&repo_path, "drop_work", &item.branch, None);
-    Ok(build_work_list(&repo_path).await)
+    Ok(build_work_list(&repo_path, registry.inner()).await)
 }
 
 fn audit_best_effort(repository: &str, action: &str, branch: &str, mr_pr: Option<&str>) {
@@ -2175,32 +2434,39 @@ pub struct ConflictInfo {
 pub async fn start_conflict_resolution(
     repo_path: String,
     target_branch: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<ConflictInfo, String> {
     require_owner(&repo_path).await?;
 
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    guard_working_tree(
-        &repo_path,
-        &mut repo,
-        &format!("resolving conflict with {target_branch}"),
-    )?;
-    let branch = current_branch(&repo)?;
+    // The lock covers only this command -- it is released the moment this
+    // returns, exactly as frozen in the design decision. It is deliberately
+    // NOT held across the Owner's edit in `open_in_external_tool` /
+    // `verify_and_commit_resolution`; the repository's own `in_progress_op`
+    // (MERGE_HEAD) is what keeps a second mutation out during that window.
+    let (branch, conflicting_files) = with_repo_lock(registry.inner(), &repo_path, || {
+        let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        guard_working_tree(
+            &repo_path,
+            &mut repo,
+            &format!("resolving conflict with {target_branch}"),
+        )?;
+        let branch = current_branch(&repo)?;
 
-    let merge = run_git(&repo_path, "merge", &target_branch, || {
-        git_core::merge_target_into_head(&repo, &target_branch)
+        let merge = run_git(&repo_path, "merge", &target_branch, || {
+            git_core::merge_target_into_head(&repo, &target_branch)
+        })
+        .map_err(|e| e.to_string())?;
+
+        if let Some(log) = conflict_log() {
+            log.start(&branch, &target_branch, &merge.target_commit.to_string()).ok();
+        }
+        audit_best_effort(&repo_path, "start_conflict_resolution", &branch, None);
+
+        Ok::<_, String>((branch, merge.conflicting_files))
     })
-    .map_err(|e| e.to_string())?;
+    .await?;
 
-    if let Some(log) = conflict_log() {
-        log.start(&branch, &target_branch, &merge.target_commit.to_string()).ok();
-    }
-    audit_best_effort(&repo_path, "start_conflict_resolution", &branch, None);
-
-    Ok(ConflictInfo {
-        branch,
-        target_branch,
-        conflicting_files: merge.conflicting_files,
-    })
+    Ok(ConflictInfo { branch, target_branch, conflicting_files })
 }
 
 /// Owner-only: launches the Owner's own configured `git mergetool` in the
@@ -2241,6 +2507,7 @@ pub async fn open_in_external_tool(repo_path: String) -> Result<(), String> {
 pub async fn verify_and_commit_resolution(
     app: AppHandle,
     repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<RepoStatus, String> {
     require_owner(&repo_path).await?;
 
@@ -2248,45 +2515,49 @@ pub async fn verify_and_commit_resolution(
         .and_then(|log| log.current().ok().flatten())
         .ok_or("no conflict resolution in progress")?;
 
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let workdir = repo
-        .workdir()
-        .ok_or("repository has no working directory")?
-        .to_path_buf();
-    git_core::verify_resolved(&repo, &workdir).map_err(|issues| {
-        issues
-            .iter()
-            .map(|i| {
-                let loc = i.line.map(|l| format!(":{l}")).unwrap_or_default();
-                format!("{}{loc}: {}", i.file, i.detail)
-            })
-            .collect::<Vec<_>>()
-            .join("; ")
-    })?;
+    with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let workdir = repo
+            .workdir()
+            .ok_or("repository has no working directory")?
+            .to_path_buf();
+        git_core::verify_resolved(&repo, &workdir).map_err(|issues| {
+            issues
+                .iter()
+                .map(|i| {
+                    let loc = i.line.map(|l| format!(":{l}")).unwrap_or_default();
+                    format!("{}{loc}: {}", i.file, i.detail)
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })?;
 
-    let target_commit = git2::Oid::from_str(&in_progress.target_commit).map_err(|e| e.to_string())?;
-    run_git(&repo_path, "commit_merge", &in_progress.branch, || {
-        git_core::commit_merge(
-            &repo,
-            target_commit,
-            &format!(
-                "merge: resolve conflict from {} into {}",
-                in_progress.target_branch, in_progress.branch
-            ),
-        )
+        let target_commit =
+            git2::Oid::from_str(&in_progress.target_commit).map_err(|e| e.to_string())?;
+        run_git(&repo_path, "commit_merge", &in_progress.branch, || {
+            git_core::commit_merge(
+                &repo,
+                target_commit,
+                &format!(
+                    "merge: resolve conflict from {} into {}",
+                    in_progress.target_branch, in_progress.branch
+                ),
+            )
+        })
+        .map_err(|e| e.to_string())?;
+        run_git(&repo_path, "push", &in_progress.branch, || {
+            git_core::push(&repo, &in_progress.branch)
+        })
+        .map_err(|e| e.to_string())
     })
-    .map_err(|e| e.to_string())?;
-    run_git(&repo_path, "push", &in_progress.branch, || {
-        git_core::push(&repo, &in_progress.branch)
-    })
-    .map_err(|e| e.to_string())?;
+    .await?;
 
     if let Some(log) = conflict_log() {
         log.clear().ok();
     }
 
     audit_best_effort(&repo_path, "verify_and_commit_resolution", &in_progress.branch, None);
-    build_and_emit_status(&app, &repo_path).await
+    build_and_emit_status(&app, &repo_path, registry.inner()).await
 }
 
 /// One capability's display state for the wizard/re-validate UI: never a
@@ -2504,14 +2775,21 @@ pub struct VersionPreview {
 /// preview -- it writes nothing. The frontend must not compute version bumps
 /// itself.
 #[tauri::command]
-pub fn get_hotfix_version_preview(repo_path: String) -> Result<VersionPreview, String> {
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let workdir = repo.workdir().ok_or("repository has no working directory")?;
-    let current = git_core::read_version_file(workdir).map_err(|e| e.to_string())?;
-    Ok(VersionPreview {
-        current_version: current.to_string(),
-        next_version: current.bump_patch().to_string(),
+pub async fn get_hotfix_version_preview(
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<VersionPreview, String> {
+    try_with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let workdir = repo.workdir().ok_or("repository has no working directory")?;
+        let current = git_core::read_version_file(workdir).map_err(|e| e.to_string())?;
+        Ok::<_, String>(VersionPreview {
+            current_version: current.to_string(),
+            next_version: current.bump_patch().to_string(),
+        })
     })
+    .await?
+    .ok_or_else(|| "repository is busy with another operation -- try again".to_string())
 }
 
 // --- Release workflow -------------------------------------------------------
@@ -2613,28 +2891,49 @@ fn candidate_production_mr(repo_path: &str, branch: &str, production: &str) -> O
 /// `develop` since the last release, the suggested next version, a CHANGELOG
 /// seed, and any candidates already in flight.
 #[tauri::command]
-pub async fn get_release_preview(repo_path: String) -> Result<ReleasePreview, String> {
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let _ = git_core::fetch_origin(&repo);
-    let production = resolve_production(&repo)?;
-    let current = production_version(&repo, &production);
+pub async fn get_release_preview(
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<ReleasePreview, String> {
+    // `fetch_origin` mutates repository state, so this whole read (which
+    // depends on refs `fetch_origin` just updated) runs inside the lock; the
+    // provider network call that follows is outside it.
+    let (production, current, commits, production_commits_not_in_develop, bump, suggested, remote_url) =
+        with_repo_lock(registry.inner(), &repo_path, || {
+            let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+            let _ = git_core::fetch_origin(&repo);
+            let production = resolve_production(&repo)?;
+            let current = production_version(&repo, &production);
 
-    let (prod_ref, dev_ref) = release_range_refs(&repo, &production);
-    let commits =
-        git_core::commits_to_release(&repo, &prod_ref, &dev_ref).map_err(|e| e.to_string())?;
-    // Reverse range: commits on production that develop lacks. Non-zero means
-    // production is ahead (hotfix / un-synced release) and develop must sync
-    // before a new release is prepared. ponytail: reuse commits_to_release with
-    // swapped refs rather than a new git helper.
-    let production_commits_not_in_develop =
-        git_core::commits_to_release(&repo, &dev_ref, &prod_ref)
-            .map_err(|e| e.to_string())?
-            .len();
-    let bump = git_core::conventional_bump(&commits);
-    let suggested = git_core::suggest_version(&current, bump);
+            let (prod_ref, dev_ref) = release_range_refs(&repo, &production);
+            let commits =
+                git_core::commits_to_release(&repo, &prod_ref, &dev_ref).map_err(|e| e.to_string())?;
+            // Reverse range: commits on production that develop lacks.
+            // Non-zero means production is ahead (hotfix / un-synced
+            // release) and develop must sync before a new release is
+            // prepared. ponytail: reuse commits_to_release with swapped refs
+            // rather than a new git helper.
+            let production_commits_not_in_develop =
+                git_core::commits_to_release(&repo, &dev_ref, &prod_ref)
+                    .map_err(|e| e.to_string())?
+                    .len();
+            let bump = git_core::conventional_bump(&commits);
+            let suggested = git_core::suggest_version(&current, bump);
+            let remote_url =
+                repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
 
-    let remote_url =
-        repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+            Ok::<_, String>((
+                production,
+                current,
+                commits,
+                production_commits_not_in_develop,
+                bump,
+                suggested,
+                remote_url,
+            ))
+        })
+        .await?;
+
     let client = provider_client_for(&remote_url).await;
 
     let mut pending = Vec::new();
@@ -2687,31 +2986,44 @@ pub async fn create_release_candidate(
     version: String,
     changelog_body: String,
     supersede_confirmed: bool,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<RepoStatusWithPath, String> {
     require_owner(&repo_path).await?;
 
-    let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    if current_branch(&repo)? != "develop" {
-        return Err("release candidates are prepared from develop -- switch to develop first".into());
-    }
-    let production = resolve_production(&repo)?;
+    // Segment 1 (locked): land on a current, clean develop and settle on the
+    // target version.
+    let (production, new_v) = with_repo_lock(registry.inner(), &repo_path, || {
+        let mut repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        if current_branch(&repo)? != "develop" {
+            return Err(
+                "release candidates are prepared from develop -- switch to develop first".into(),
+            );
+        }
+        let production = resolve_production(&repo)?;
 
-    guard_working_tree(&repo_path, &mut repo, "preparing a release candidate")?;
+        guard_working_tree(&repo_path, &mut repo, "preparing a release candidate")?;
 
-    let _ = git_core::fetch_origin(&repo);
-    run_git(&repo_path, "fast_forward", "develop", || {
-        git_core::fast_forward_from_origin(&repo, "develop")
+        let _ = git_core::fetch_origin(&repo);
+        run_git(&repo_path, "fast_forward", "develop", || {
+            git_core::fast_forward_from_origin(&repo, "develop")
+        })
+        .map_err(|e| e.to_string())?;
+
+        let current = production_version(&repo, &production);
+        let new_v = git_core::Version::parse(&version).map_err(|e| e.to_string())?;
+        if new_v <= current {
+            return Err(format!(
+                "version {new_v} must be greater than the current production version {current}"
+            ));
+        }
+        Ok::<_, String>((production, new_v))
     })
-    .map_err(|e| e.to_string())?;
+    .await?;
 
-    let current = production_version(&repo, &production);
-    let new_v = git_core::Version::parse(&version).map_err(|e| e.to_string())?;
-    if new_v <= current {
-        return Err(format!(
-            "version {new_v} must be greater than the current production version {current}"
-        ));
-    }
-
+    // Unlocked (SQLite, then a bounded read-only provider check -- see the
+    // audit note on why this one, unlike finish_*, does not need its own
+    // segment: the network call here never leads into a further repository
+    // touch, it only decides whether to return early).
     let pending: Vec<auth_core::WipItem> = wip_item_log()
         .and_then(|l| l.by_type(&repo_path, "release").ok())
         .unwrap_or_default()
@@ -2720,8 +3032,7 @@ pub async fn create_release_candidate(
         .collect();
 
     if !pending.is_empty() {
-        let remote_url =
-            repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+        let remote_url = git_core::read_repo_info(&repo_path).ok().and_then(|i| i.remote_url);
         if let Some(client) = provider_client_for(&remote_url).await {
             for item in &pending {
                 let Some(iid) = candidate_production_mr(&repo_path, &item.branch, &production)
@@ -2747,29 +3058,39 @@ pub async fn create_release_candidate(
         }
     }
 
-    let mut name = format!("release/{new_v}");
-    let mut n = 2;
-    while git_core::ref_exists(&repo, &name) {
-        name = format!("release/{new_v}-{n}");
-        n += 1;
-    }
+    // Segment 2 (locked again): create the release branch and its one prep
+    // commit.
+    let name = with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
 
-    run_git(&repo_path, "create_release_branch", &name, || {
-        git_core::create_release_branch(&repo, &name, "develop")
-    })
-    .map_err(|e| e.to_string())?;
+        let mut name = format!("release/{new_v}");
+        let mut n = 2;
+        while git_core::ref_exists(&repo, &name) {
+            name = format!("release/{new_v}-{n}");
+            n += 1;
+        }
 
-    let workdir = repo
-        .workdir()
-        .ok_or("repository has no working directory")?
-        .to_path_buf();
-    git_core::write_version_file(&workdir, &new_v).map_err(|e| e.to_string())?;
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    git_core::prepend_section(&workdir, &new_v, &today, &changelog_body).map_err(|e| e.to_string())?;
-
-    let msg = format!("chore: release {new_v}");
-    run_git(&repo_path, "commit", &msg, || git_core::commit_all(&repo, &msg))
+        run_git(&repo_path, "create_release_branch", &name, || {
+            git_core::create_release_branch(&repo, &name, "develop")
+        })
         .map_err(|e| e.to_string())?;
+
+        let workdir = repo
+            .workdir()
+            .ok_or("repository has no working directory")?
+            .to_path_buf();
+        git_core::write_version_file(&workdir, &new_v).map_err(|e| e.to_string())?;
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        git_core::prepend_section(&workdir, &new_v, &today, &changelog_body)
+            .map_err(|e| e.to_string())?;
+
+        let msg = format!("chore: release {new_v}");
+        run_git(&repo_path, "commit", &msg, || git_core::commit_all(&repo, &msg))
+            .map_err(|e| e.to_string())?;
+
+        Ok::<_, String>(name)
+    })
+    .await?;
 
     if let Some(log) = wip_item_log() {
         log.start(&repo_path, &name, "release").ok();
@@ -2779,7 +3100,7 @@ pub async fn create_release_candidate(
     }
     audit_best_effort(&repo_path, "create_release_candidate", &name, None);
 
-    let status = build_and_emit_status(&app, &repo_path).await?;
+    let status = build_and_emit_status(&app, &repo_path, registry.inner()).await?;
     Ok(RepoStatusWithPath { status, repo_path })
 }
 
@@ -2792,21 +3113,28 @@ pub async fn finish_release(
     app: AppHandle,
     repo_path: String,
     title: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<RepoStatusWithPath, String> {
     require_owner(&repo_path).await?;
 
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let branch = current_branch(&repo)?;
-    if classify_branch(&branch) != BranchClass::Release {
-        return Err("finish_release must run on a release/* branch".into());
-    }
-    let production = resolve_production(&repo)?;
+    // Segment 1 (locked): push, then read what the provider call needs.
+    let (branch, production, remote_url) = with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let branch = current_branch(&repo)?;
+        if classify_branch(&branch) != BranchClass::Release {
+            return Err("finish_release must run on a release/* branch".into());
+        }
+        let production = resolve_production(&repo)?;
 
-    run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch))
-        .map_err(|e| e.to_string())?;
+        run_git(&repo_path, "push", &branch, || git_core::push(&repo, &branch))
+            .map_err(|e| e.to_string())?;
 
-    let remote_url =
-        repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+        let remote_url = repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+        Ok::<_, String>((branch, production, remote_url))
+    })
+    .await?;
+
+    // Unlocked: the provider REST call.
     let client = provider_client_for(&remote_url)
         .await
         .ok_or("could not reach the provider API for this remote (check token/host)")?;
@@ -2823,12 +3151,18 @@ pub async fn finish_release(
     }
     audit_best_effort(&repo_path, "finish_release", &branch, Some(&mr.id));
 
-    // Developer side done -- park back on develop. Best-effort (see finish_hotfix).
-    let _ = run_git(&repo_path, "checkout", "develop", || {
-        git_core::checkout_branch(&repo, "develop")
-    });
+    // Segment 2 (locked again): developer side done -- park back on develop.
+    // Best-effort (see finish_hotfix).
+    let _ = with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let _ = run_git(&repo_path, "checkout", "develop", || {
+            git_core::checkout_branch(&repo, "develop")
+        });
+        Ok::<_, String>(())
+    })
+    .await;
 
-    let status = build_and_emit_status(&app, &repo_path).await?;
+    let status = build_and_emit_status(&app, &repo_path, registry.inner()).await?;
     Ok(RepoStatusWithPath { status, repo_path })
 }
 
@@ -2882,14 +3216,19 @@ pub async fn sync_develop_after_release(
     repo_path: String,
     candidate_branch: String,
     title: String,
+    registry: State<'_, RepoLockRegistry>,
 ) -> Result<RepoStatus, String> {
     require_owner(&repo_path).await?;
 
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let production = resolve_production(&repo)?;
+    // Segment 1 (locked): read what the provider call needs.
+    let (production, remote_url) = with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let production = resolve_production(&repo)?;
+        let remote_url = repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+        Ok::<_, String>((production, remote_url))
+    })
+    .await?;
 
-    let remote_url =
-        repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
     let client = provider_client_for(&remote_url)
         .await
         .ok_or("could not reach the provider API for this remote (check token/host)")?;
@@ -2898,7 +3237,16 @@ pub async fn sync_develop_after_release(
     let prod_mr = candidate_production_mr(&repo_path, &candidate_branch, &production)
         .ok_or("no production merge request is tracked for this release candidate")?;
     let merged = mr_snapshot(&client, &prod_mr).await.map(|m| m.merged).unwrap_or(false);
-    sync_release_tag_inner(&repo_path, &candidate_branch, merged)?;
+
+    // Segment 2 (locked again): the outer command owns the lock for this
+    // call -- `sync_release_tag_inner` does its own second `Repository::
+    // discover` internally but must NOT (and does not) acquire the repo
+    // lock itself; re-entering the same `tokio::sync::Mutex` from inside its
+    // own held guard would deadlock.
+    with_repo_lock(registry.inner(), &repo_path, || {
+        sync_release_tag_inner(&repo_path, &candidate_branch, merged)
+    })
+    .await?;
 
     // Reuse an already-open sync MR on retry rather than opening a duplicate.
     let existing_sync = work_item_log()
@@ -2923,15 +3271,26 @@ pub async fn sync_develop_after_release(
     };
     audit_best_effort(&repo_path, "sync_develop_after_release", &candidate_branch, Some(&mr_id));
 
-    build_and_emit_status(&app, &repo_path).await
+    build_and_emit_status(&app, &repo_path, registry.inner()).await
 }
 
 /// Read-only: the current release candidate's two MRs plus any superseded
 /// candidates. `None` when no release candidate is tracked for this repo.
 #[tauri::command]
-pub async fn get_release_status(repo_path: String) -> Result<Option<ReleaseStatusDto>, String> {
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let production = resolve_production(&repo)?;
+pub async fn get_release_status(
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<Option<ReleaseStatusDto>, String> {
+    let Some((production, remote_url)) = try_with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let production = resolve_production(&repo)?;
+        let remote_url = repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
+        Ok::<_, String>((production, remote_url))
+    })
+    .await?
+    else {
+        return Ok(None); // repository busy with another operation -- skip this poll
+    };
 
     let all = wip_item_log()
         .and_then(|l| l.by_type(&repo_path, "release").ok())
@@ -2944,8 +3303,6 @@ pub async fn get_release_status(repo_path: String) -> Result<Option<ReleaseStatu
         return Ok(None);
     };
 
-    let remote_url =
-        repo.find_remote("origin").ok().and_then(|r| r.url().map(str::to_string));
     let client = provider_client_for(&remote_url).await;
 
     let mrs = work_item_log()
@@ -3009,28 +3366,36 @@ pub async fn get_release_status(repo_path: String) -> Result<Option<ReleaseStatu
 /// plain pull that never touches uncommitted work (Work Safe). Surfaced as the
 /// next action whenever HEAD sits on a stale develop/production.
 #[tauri::command]
-pub async fn update_branch(app: AppHandle, repo_path: String) -> Result<RepoStatus, String> {
-    let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
-    let branch = current_branch(&repo)?;
-    let production = resolve_production(&repo).ok();
-    if branch != "develop" && production.as_deref() != Some(branch.as_str()) {
-        return Err("update is only for develop or the production branch".into());
-    }
-    if git_core::read_repository_state(&repo)
-        .map_err(|e| e.to_string())?
-        .working_tree
-        .is_dirty()
-    {
-        return Err("commit or save your work first -- update does a plain fast-forward".into());
-    }
+pub async fn update_branch(
+    app: AppHandle,
+    repo_path: String,
+    registry: State<'_, RepoLockRegistry>,
+) -> Result<RepoStatus, String> {
+    let branch = with_repo_lock(registry.inner(), &repo_path, || {
+        let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
+        let branch = current_branch(&repo)?;
+        let production = resolve_production(&repo).ok();
+        if branch != "develop" && production.as_deref() != Some(branch.as_str()) {
+            return Err("update is only for develop or the production branch".into());
+        }
+        if git_core::read_repository_state(&repo)
+            .map_err(|e| e.to_string())?
+            .working_tree
+            .is_dirty()
+        {
+            return Err("commit or save your work first -- update does a plain fast-forward".into());
+        }
 
-    let _ = git_core::fetch_origin(&repo);
-    run_git(&repo_path, "fast_forward", &branch, || {
-        git_core::fast_forward_from_origin(&repo, &branch)
+        let _ = git_core::fetch_origin(&repo);
+        run_git(&repo_path, "fast_forward", &branch, || {
+            git_core::fast_forward_from_origin(&repo, &branch)
+        })
+        .map_err(|e| e.to_string())?;
+        Ok::<_, String>(branch)
     })
-    .map_err(|e| e.to_string())?;
+    .await?;
     audit_best_effort(&repo_path, "update_branch", &branch, None);
-    build_and_emit_status(&app, &repo_path).await
+    build_and_emit_status(&app, &repo_path, registry.inner()).await
 }
 
 /// UI integration (not workflow logic): open the repo's working directory in
@@ -3251,7 +3616,9 @@ mod tests {
     async fn setup_state_plain_dir_is_not_a_repo() {
         isolate_db();
         let dir = tempdir().unwrap();
-        let s = get_setup_state(dir.path().to_str().unwrap().to_string()).await.unwrap();
+        let s = get_setup_state_inner(dir.path().to_str().unwrap(), &RepoLockRegistry::default())
+            .await
+            .unwrap();
         assert_eq!(s.phase, "not_a_repo");
         assert!(s.needs_git_init);
     }
@@ -3261,7 +3628,9 @@ mod tests {
         isolate_db();
         let dir = tempdir().unwrap();
         git(dir.path(), &["init", "-b", "main"]);
-        let s = get_setup_state(dir.path().to_str().unwrap().to_string()).await.unwrap();
+        let s = get_setup_state_inner(dir.path().to_str().unwrap(), &RepoLockRegistry::default())
+            .await
+            .unwrap();
         assert_eq!(s.phase, "needs_first_commit");
     }
 
@@ -3276,7 +3645,9 @@ mod tests {
         git(dir.path(), &["add", "a.txt"]);
         git(dir.path(), &["commit", "-m", "init"]);
 
-        let s = get_setup_state(dir.path().to_str().unwrap().to_string()).await.unwrap();
+        let s = get_setup_state_inner(dir.path().to_str().unwrap(), &RepoLockRegistry::default())
+            .await
+            .unwrap();
         assert_eq!(s.phase, "preflight_failed");
         assert_eq!(s.checks.len(), 7);
     }

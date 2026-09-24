@@ -1,10 +1,12 @@
 mod commands;
 mod events;
+mod repo_lock;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
+    .manage(repo_lock::RepoLockRegistry::default())
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
