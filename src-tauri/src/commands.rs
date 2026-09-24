@@ -2262,13 +2262,24 @@ pub async fn continue_work(
 
             // Auto-apply the branch's Saved Work. The tree is clean here
             // (guard stashed whatever was dirty on the branch we just left),
-            // so this is safe.
+            // so this is safe. Claims the row via `try_claim` before touching
+            // it -- the same atomic guard `resume_work`/`discard_work` use --
+            // so a concurrent `resume_work`/`discard_work` call on the same
+            // id (a double-click, or one racing this checkout) can't also
+            // act on it: without the claim, both could pass a plain read
+            // check before either wrote back, and this checkout's own
+            // `git_core::restore_work` call on the same stash_oid would then
+            // race the other command's.
             let swlog = saved_work_log();
-            let saved_rec = swlog
+            let candidate = swlog
                 .as_ref()
                 .and_then(|l| l.saved_for_branch(&repo_path, &item.branch).ok().flatten());
+            let claimed = match (swlog.as_ref(), candidate.as_ref()) {
+                (Some(l), Some(c)) => l.try_claim(c.id, &["saved"]).ok().flatten(),
+                _ => None,
+            };
 
-            let (restore_outcome, conflicting_files) = match (swlog.as_ref(), saved_rec.as_ref()) {
+            let (restore_outcome, conflicting_files) = match (swlog.as_ref(), claimed.as_ref()) {
                 (Some(l), Some(rec)) => {
                     match run_git(&repo_path, "restore_work", &rec.branch, || {
                         git_core::restore_work(&mut repo, &rec.stash_oid)
@@ -2283,13 +2294,18 @@ pub async fn continue_work(
                             audit_best_effort(&repo_path, "resume_work_conflict", &rec.branch, None);
                             ("conflict".to_string(), files)
                         }
-                        Err(_) => ("error".to_string(), vec![]),
+                        Err(_) => {
+                            // Release the claim so the entry is still
+                            // resumable -- it was untouched before this.
+                            l.set_status(rec.id, &rec.status).ok();
+                            ("error".to_string(), vec![])
+                        }
                     }
                 }
                 _ => ("none".to_string(), vec![]),
             };
 
-            Ok::<_, String>((saved_rec, restore_outcome, conflicting_files))
+            Ok::<_, String>((claimed, restore_outcome, conflicting_files))
         })
         .await?;
 
