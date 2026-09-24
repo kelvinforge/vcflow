@@ -141,6 +141,50 @@ impl SavedWorkLog {
             None => Ok(None),
         }
     }
+
+    /// Atomically claims `id` for exclusive processing (resume/discard):
+    /// flips it to the private `"processing"` status via a single
+    /// `UPDATE ... WHERE status IN (...)`, but only when its current status
+    /// is one of `allowed_from`. This -- not the per-repository lock in
+    /// `repo_lock.rs` -- is what closes the TOCTOU between a caller's status
+    /// check and its own status write: the repository and this log row are
+    /// two different resources, so serializing git ops alone does not stop
+    /// two commands from both reading `"saved"` before either writes back.
+    ///
+    /// Returns the record *as it was before the claim* when the claim
+    /// succeeded -- the caller now exclusively owns finishing the
+    /// transition, and on any failure MUST call
+    /// `set_status(id, &that_record.status)` to release the claim, or the
+    /// row is stuck as `"processing"` forever. Returns `None` when another
+    /// caller already claimed/finished it, the row doesn't exist, or its
+    /// status wasn't in `allowed_from` -- the caller cannot tell those apart
+    /// and does not need to: all mean "there is nothing left for you to do
+    /// here".
+    pub fn try_claim(
+        &self,
+        id: i64,
+        allowed_from: &[&str],
+    ) -> Result<Option<SavedWorkRecord>, AuditError> {
+        let before = match self.get(id)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if !allowed_from.contains(&before.status.as_str()) {
+            return Ok(None);
+        }
+        let placeholders: Vec<String> =
+            (0..allowed_from.len()).map(|i| format!("?{}", i + 2)).collect();
+        let sql = format!(
+            "UPDATE saved_work SET status = 'processing' WHERE id = ?1 AND status IN ({})",
+            placeholders.join(", ")
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&id];
+        for s in allowed_from {
+            params.push(s);
+        }
+        let changed = self.conn.execute(&sql, params.as_slice())?;
+        Ok(if changed == 1 { Some(before) } else { None })
+    }
 }
 
 fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<SavedWorkRecord> {
@@ -226,5 +270,51 @@ mod tests {
     fn get_missing_is_none() {
         let (_d, log) = open_log();
         assert!(log.get(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn try_claim_succeeds_once_and_locks_out_a_second_racer() {
+        let (_d, log) = open_log();
+        let id = log.record("/repo", "feature/x", "abc123", "wip", "").unwrap();
+
+        let first = log.try_claim(id, &["saved"]).unwrap();
+        assert_eq!(first.unwrap().status, "saved");
+
+        // A second caller racing the same id -- same call a real resume_work
+        // and discard_work would both make -- must not also claim it.
+        let second = log.try_claim(id, &["saved"]).unwrap();
+        assert!(second.is_none());
+        assert_eq!(log.get(id).unwrap().unwrap().status, "processing");
+    }
+
+    #[test]
+    fn try_claim_rejects_a_status_not_in_allowed_from() {
+        let (_d, log) = open_log();
+        let id = log.record("/repo", "feature/x", "abc123", "wip", "").unwrap();
+        log.set_status(id, "restored").unwrap();
+
+        assert!(log.try_claim(id, &["saved", "conflict"]).unwrap().is_none());
+        // Rejected claim must not touch the row.
+        assert_eq!(log.get(id).unwrap().unwrap().status, "restored");
+    }
+
+    #[test]
+    fn try_claim_on_missing_id_is_none() {
+        let (_d, log) = open_log();
+        assert!(log.try_claim(999, &["saved"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn caller_can_release_a_claim_back_to_its_original_status() {
+        let (_d, log) = open_log();
+        let id = log.record("/repo", "feature/x", "abc123", "wip", "").unwrap();
+
+        let claimed = log.try_claim(id, &["saved"]).unwrap().unwrap();
+        // Simulate the caller's git op failing: release the claim.
+        log.set_status(id, &claimed.status).unwrap();
+
+        assert_eq!(log.get(id).unwrap().unwrap().status, "saved");
+        // Now resumable again by a fresh claim.
+        assert!(log.try_claim(id, &["saved"]).unwrap().is_some());
     }
 }
