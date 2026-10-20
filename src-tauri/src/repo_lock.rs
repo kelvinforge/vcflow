@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use git2::Repository;
 use tokio::sync::Mutex as AsyncMutex;
@@ -83,6 +84,30 @@ pub async fn with_repo_lock<T>(
     let _guard = repo_lock.lock().await;
     f()
 }
+
+/// How long a one-shot read waits for a contended lock before giving up.
+pub const ONE_SHOT_WAIT: Duration = Duration::from_secs(5);
+
+/// Bounded acquire -- for one-shot reads fired at mount (preflight, setup
+/// state, focus card, previews). Waits out a short mutation instead of
+/// failing fast like `try_with_repo_lock`, but never queues forever behind a
+/// slow push/fetch like `with_repo_lock`: after `wait` it returns the same
+/// "busy" error the caller would otherwise surface.
+pub async fn wait_with_repo_lock<T>(
+    registry: &RepoLockRegistry,
+    repo_path: &str,
+    wait: Duration,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let key = canonical_repo_key(repo_path)?;
+    let repo_lock = registry.lock_for(&key);
+    let _guard = tokio::time::timeout(wait, repo_lock.lock())
+        .await
+        .map_err(|_| BUSY.to_string())?;
+    f()
+}
+
+pub const BUSY: &str = "repository is busy with another operation -- try again";
 
 /// Non-blocking acquire -- for background/polling reads (the frontend's 3s/15s
 /// timers). `Ok(None)` means the lock is currently held elsewhere; callers
@@ -184,6 +209,39 @@ mod tests {
         let result =
             try_with_repo_lock(&registry, dir.path().to_str().unwrap(), || Ok::<_, String>(1)).await;
         assert!(result.is_err(), "a non-repository path must be Err, not Ok(None)");
+    }
+
+    #[tokio::test]
+    async fn bounded_wait_succeeds_once_the_holder_releases() {
+        let dir = tempdir().unwrap();
+        init_repo(dir.path());
+        let path = dir.path().to_str().unwrap();
+        let registry = RepoLockRegistry::default();
+
+        let held = registry.lock_for(&canonical_repo_key(path).unwrap());
+        let guard = held.lock().await;
+        let release = async {
+            tokio::task::yield_now().await;
+            drop(guard);
+        };
+        let read = wait_with_repo_lock(&registry, path, Duration::from_secs(5), || Ok::<_, String>(7));
+        let (_, result) = tokio::join!(release, read);
+        assert_eq!(result.unwrap(), 7, "a briefly held lock must be waited out, not reported busy");
+    }
+
+    #[tokio::test]
+    async fn bounded_wait_reports_busy_after_the_timeout() {
+        let dir = tempdir().unwrap();
+        init_repo(dir.path());
+        let path = dir.path().to_str().unwrap();
+        let registry = RepoLockRegistry::default();
+
+        let held = registry.lock_for(&canonical_repo_key(path).unwrap());
+        let _guard = held.lock().await; // a slow push that outlasts the wait
+
+        let result =
+            wait_with_repo_lock(&registry, path, Duration::from_millis(50), || Ok::<_, String>(7)).await;
+        assert_eq!(result.unwrap_err(), BUSY);
     }
 
     #[tokio::test]
