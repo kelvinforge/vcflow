@@ -19,7 +19,7 @@ use workflow_engine::{
 
 use crate::events::WORKFLOW_STATE_CHANGED;
 use crate::remote_probe_cache;
-use crate::repo_lock::{self, try_with_repo_lock, with_repo_lock, RepoLockRegistry};
+use crate::repo_lock::{self, try_with_repo_lock, wait_with_repo_lock, with_repo_lock, RepoLockRegistry};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoStatus {
@@ -288,14 +288,13 @@ async fn repository_preflight_inner(
     }
 
     // Segment 1 (locked): just read the remote URL -- the only fact the
-    // network step below needs. `with_repo_lock` (waits), not
-    // `try_with_repo_lock` (skips) -- this is a one-shot eligibility check
-    // fired at mount, never a tight poll, so briefly waiting out a
-    // contended lock is correct; treating "busy" as a hard error here
-    // surfaced as the Setup Card showing a full "could not read this
-    // directory" failure for a perfectly healthy repo whenever this raced
-    // another command's own lock acquisition at app launch.
-    let remote_url = with_repo_lock(registry, repo_path, || {
+    // network step below needs. `wait_with_repo_lock` (bounded wait), not
+    // `try_with_repo_lock` (skips) nor `with_repo_lock` (waits forever) --
+    // this is a one-shot eligibility check fired at mount: briefly waiting
+    // out a contended lock avoids a false "could not read this directory"
+    // at app launch, and the bound keeps a slow push/fetch from leaving the
+    // Setup Card spinning.
+    let remote_url = wait_with_repo_lock(registry, repo_path, repo_lock::ONE_SHOT_WAIT, || {
         let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
         Ok::<_, String>(
             repo.find_remote("origin").ok().and_then(|rm| rm.url().map(str::to_string)),
@@ -313,8 +312,8 @@ async fn repository_preflight_inner(
     // Segment 2 (locked): the SSH connectivity probe is a blocking call, not
     // `.await`, so it belongs back inside the lock alongside the final
     // repository reads `assemble_preflight` itself performs. Same
-    // wait-not-skip reasoning as segment 1.
-    let pf = with_repo_lock(registry, repo_path, || {
+    // bounded-wait reasoning as segment 1.
+    let pf = wait_with_repo_lock(registry, repo_path, repo_lock::ONE_SHOT_WAIT, || {
         let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
         let remote_conn =
             remote_url.is_some().then(|| git_core::validate_remote_connection(&repo));
@@ -411,9 +410,10 @@ pub async fn initialize_workflow(
     registry: State<'_, RepoLockRegistry>,
     probe_cache: State<'_, remote_probe_cache::RemoteProbeCache>,
 ) -> Result<WorkflowInitDto, String> {
-    // Preflight is read-only eligibility checking -- it goes through its own
-    // (try_lock) reads internally and is intentionally NOT held under the
-    // blocking mutation lock acquired below.
+    // Preflight is read-only eligibility checking -- it takes and releases
+    // its own bounded-wait reads internally. Sequential, never nested: it
+    // must NOT run inside the mutation lock acquired below, or it would
+    // wait on itself.
     let pf = repository_preflight(repo_path.clone(), registry.clone(), probe_cache.clone()).await?;
     if !pf.eligible {
         let reason = pf
@@ -613,10 +613,10 @@ async fn get_setup_state_inner(
     registry: &RepoLockRegistry,
     probe_cache: &remote_probe_cache::RemoteProbeCache,
 ) -> Result<SetupStateDto, String> {
-    // `repository_preflight_inner` acquires and releases its own (try_lock)
-    // reads internally before returning -- calling it here is a separate,
-    // sequential acquisition, never a nested one, so there is no
-    // self-deadlock risk against the try_with_repo_lock call below.
+    // `repository_preflight_inner` acquires and releases its own
+    // bounded-wait reads internally before returning -- calling it here is a
+    // separate, sequential acquisition. Keep it that way: nesting it inside
+    // the lock call below would make it wait on a lock this task holds.
     let pf = repository_preflight_inner(repo_path, registry, probe_cache).await?;
 
     let mut dto = SetupStateDto {
@@ -643,11 +643,9 @@ async fn get_setup_state_inner(
 
     // Preflight already confirmed a real, readable repository exists at this
     // point, so this is an ordinary locked read, not the "not a repository
-    // yet" tolerant case. `with_repo_lock`, not `try_with_repo_lock` -- see
-    // the matching comment in `repository_preflight_inner`: this is a
-    // one-shot gate check, not a tight poll, so it should wait out a
-    // contended lock rather than surface "busy" as a hard failure.
-    let (develop, dirty) = with_repo_lock(registry, repo_path, || {
+    // yet" tolerant case. Bounded wait -- see the matching comment in
+    // `repository_preflight_inner`.
+    let (develop, dirty) = wait_with_repo_lock(registry, repo_path, repo_lock::ONE_SHOT_WAIT, || {
         let repo = Repository::discover(repo_path).map_err(|e| e.to_string())?;
         let develop = develop_exists(&repo);
         let dirty = git_core::read_repository_state(&repo)
@@ -1232,7 +1230,7 @@ pub async fn get_next_action(
     registry: State<'_, RepoLockRegistry>,
 ) -> Result<NextActionDto, String> {
     let (branch, class, dirty, in_progress_op, ahead, behind, diverged, primary_target, remote_url) =
-        try_with_repo_lock(registry.inner(), &repo_path, || {
+        wait_with_repo_lock(registry.inner(), &repo_path, repo_lock::ONE_SHOT_WAIT, || {
             let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
             let branch = current_branch(&repo)?;
             let class = classify_branch(&branch);
@@ -1273,8 +1271,7 @@ pub async fn get_next_action(
                 remote_url,
             ))
         })
-        .await?
-        .ok_or("repository is busy with another operation -- try again")?;
+        .await?;
 
     let role = resolve_workflow_role(&repo_path).await;
 
@@ -2990,7 +2987,7 @@ pub async fn get_hotfix_version_preview(
     repo_path: String,
     registry: State<'_, RepoLockRegistry>,
 ) -> Result<VersionPreview, String> {
-    try_with_repo_lock(registry.inner(), &repo_path, || {
+    wait_with_repo_lock(registry.inner(), &repo_path, repo_lock::ONE_SHOT_WAIT, || {
         let repo = Repository::discover(&repo_path).map_err(|e| e.to_string())?;
         let workdir = repo.workdir().ok_or("repository has no working directory")?;
         let current = git_core::read_version_file(workdir).map_err(|e| e.to_string())?;
@@ -2999,8 +2996,7 @@ pub async fn get_hotfix_version_preview(
             next_version: current.bump_patch().to_string(),
         })
     })
-    .await?
-    .ok_or_else(|| "repository is busy with another operation -- try again".to_string())
+    .await
 }
 
 // --- Release workflow -------------------------------------------------------

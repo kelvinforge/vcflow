@@ -37,16 +37,21 @@ export function useSetupGate(repoPath: string): SetupGate {
   const refresh = useCallback(() => {
     const repo = repoRef.current
     const g = ++gen.current
+    const current = () => g === gen.current && repoRef.current === repo
     setLoading(true)
+    // One retry after a short pause: a transient error (e.g. "repository is
+    // busy" after the backend's bounded lock wait) must not jump straight to
+    // the full "could not read this directory" screen.
     getSetupState(repo)
+      .catch(() => new Promise((r) => setTimeout(r, 1000)).then(() => getSetupState(repo)))
       .then((s) => {
-        if (g === gen.current && repoRef.current === repo) setState(s)
+        if (current()) setState(s)
       })
       .catch(() => {
-        if (g === gen.current && repoRef.current === repo) setState(null)
+        if (current()) setState(null)
       })
       .finally(() => {
-        if (g === gen.current && repoRef.current === repo) setLoading(false)
+        if (current()) setLoading(false)
       })
   }, [])
 
