@@ -32,7 +32,14 @@ function App() {
           refreshing={wf.refreshing}
           // Directory picker is blocked while Initial Workflow is running.
           onOpenRepo={setup.initializing ? () => {} : wf.setRepoPath}
-          onRefresh={wf.refreshNow}
+          // TokenButton (inside this header) fires onChanged after a token
+          // save/delete -- refresh both: wf so RepoStatus.gitlab_ok updates,
+          // setup so the Setup Card's own preflight display (a separate
+          // read) doesn't stay stale showing the pre-save token failure.
+          onRefresh={() => {
+            wf.refreshNow()
+            setup.refresh()
+          }}
         />
       </header>
 

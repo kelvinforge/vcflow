@@ -1,10 +1,18 @@
 mod commands;
 mod events;
+mod remote_probe_cache;
+mod repo_lock;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+  // Cap libgit2's TCP connect (SSH probe, push, fetch) instead of the OS
+  // default (~75s): preflight runs its SSH probe while holding the repo lock.
+  // Safety: process-global libgit2 option, set once before any git2 use.
+  let _ = unsafe { git2::opts::set_server_connect_timeout_in_milliseconds(10_000) };
   tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
+    .manage(repo_lock::RepoLockRegistry::default())
+    .manage(remote_probe_cache::RemoteProbeCache::default())
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(

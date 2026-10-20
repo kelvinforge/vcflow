@@ -162,7 +162,19 @@ export function useWorkflow(initialRepoPath: string): WorkflowState {
   }, [applyStatus])
 
   // 15s timer path: fetch origin, rebuild RepoStatus. Nothing else.
+  //
+  // Reentrancy guard: the timer, refreshNow, the focus handler, and
+  // enter/endInspection can all reach this independently, and nothing
+  // upstream stops two of them landing close enough together to overlap (the
+  // busyRef/inspectingRef checks live at each *caller*, not here, and
+  // refreshNow in particular has none). Without this, two in-flight
+  // `refreshRepoStatus` calls race applyStatus with no ordering guarantee, so
+  // whichever response lands second can overwrite fresher ahead/behind
+  // numbers with a stale one -- unlike refreshSnapshot, which is already
+  // gen-counter-protected against exactly this. Skip instead of queuing,
+  // same "busy = skip, not an error" idiom `readLocal` already uses below.
   const syncRepo = useCallback(async () => {
+    if (fetchingRef.current) return
     const repo = repoRef.current
     setRefreshing(true)
     fetchingRef.current = true
