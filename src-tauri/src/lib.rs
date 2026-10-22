@@ -11,9 +11,14 @@ pub fn run() {
   let _ = unsafe { git2::opts::set_server_connect_timeout_in_milliseconds(10_000) };
   tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
+    .plugin(tauri_plugin_process::init())
     .manage(repo_lock::RepoLockRegistry::default())
     .manage(remote_probe_cache::RemoteProbeCache::default())
     .setup(|app| {
+      #[cfg(desktop)]
+      app
+        .handle()
+        .plugin(tauri_plugin_updater::Builder::new().build())?;
       if cfg!(debug_assertions) {
         app.handle().plugin(
           tauri_plugin_log::Builder::default()
