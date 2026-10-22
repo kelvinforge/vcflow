@@ -32,6 +32,7 @@ log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
 git_core = { path = "crates/git_core" }
 provider_core = { path = "crates/provider_core" }
 workflow_engine = { path = "crates/workflow_engine" }
@@ -46,3 +47,8 @@ dirs = "6"
 # RepoLockRegistry's per-repository lock (src/repo_lock.rs) -- "sync" only,
 # the async runtime itself comes from tauri.
 tokio = { version = "1", features = ["sync", "time"] }
+
+# Self-update (desktop only): reads latest.json from the GitHub Release and
+# verifies each bundle against the minisign pubkey in tauri.conf.json.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
