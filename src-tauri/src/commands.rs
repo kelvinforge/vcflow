@@ -681,10 +681,11 @@ async fn get_setup_state_inner(
     Ok(dto)
 }
 
-/// Saves a provider Personal Access Token into the OS keychain, under the
-/// service the repo's `origin` resolves to: `github|<host>|default` for a
-/// GitHub remote, `gitlab|<host>|default` otherwise. The token only ever
-/// lives in the keychain -- never localStorage, SQLite, config, or logs.
+/// Saves a provider Personal Access Token into the encrypted credential file
+/// (`auth_core::CredentialStore`), under the service the repo's `origin`
+/// resolves to: `github|<host>|default` for a GitHub remote,
+/// `gitlab|<host>|default` otherwise. The token only ever lives in that
+/// file -- never localStorage, SQLite, config, or logs.
 #[tauri::command]
 pub async fn save_token(
     repo_path: String,
@@ -1751,7 +1752,7 @@ impl ApiClient {
 }
 
 /// Resolves the provider API client for a repo's `origin` URL, reading the
-/// matching keychain credential (`github|<host>|default` or
+/// matching stored credential (`github|<host>|default` or
 /// `gitlab|<host>|default`). `None` when the remote can't be parsed, no token
 /// is stored for it, or the API host can't be reached.
 ///
