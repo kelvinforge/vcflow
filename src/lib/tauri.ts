@@ -403,7 +403,7 @@ export interface TokenValidation {
   capabilities: CapabilityItem[]
 }
 
-/** Saves a PAT to the OS keychain. The backend picks the GitHub vs GitLab
+/** Saves a PAT to the encrypted credential file. The backend picks the GitHub vs GitLab
  *  credential path from the repo's remote -- the frontend never sees or
  *  stores the token. */
 export function saveToken(repoPath: string, host: string, token: string): Promise<void> {
