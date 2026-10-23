@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -27,11 +27,17 @@ impl From<std::io::Error> for CredentialError {
 }
 
 /// Keychain service the tokens lived under before the encrypted file.
+#[cfg(not(target_os = "macos"))]
 const LEGACY_KEYRING_SERVICE: &str = "git-workflow-engine";
 const NONCE_LEN: usize = 12;
 
-/// Serializes read-modify-write of the credential file across commands.
-static FILE_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes read-modify-write of the credential file across commands, and
+/// holds the keys whose legacy keychain item this process already tried.
+// ponytail: in-process lock only; two app instances saving at the same
+// instant can still lose one save. Add a file lock if that ever matters.
+static FILE_LOCK: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+static MACHINE_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
 /// Reads/writes provider access tokens, keyed by `provider|host|account`.
 /// Never stores anything but the token string itself.
@@ -41,9 +47,10 @@ static FILE_LOCK: Mutex<()> = Mutex::new(());
 /// trusts the build that created it, and ad-hoc signed builds change
 /// identity on every update, so each update lost the token.
 ///
-/// The key is derived from this machine's ID, so a copied file or a leaked
-/// backup can't be decrypted elsewhere. It does NOT protect against code
-/// running as the same user on the same machine -- accepted tradeoff, see
+/// The key is derived from this machine's ID and the home path, so the file
+/// copied on its own can't be decrypted elsewhere. The ID is not secret:
+/// anyone with both the file and the machine ID (a full-disk backup, code
+/// running as the same user) can rebuild the key. Accepted tradeoff, see
 /// bugs/keychain-access-after-update in the vault.
 pub struct CredentialStore;
 
@@ -61,18 +68,19 @@ impl CredentialStore {
 
     pub fn get(provider: &str, host: &str, account: &str) -> Result<String, CredentialError> {
         let key = Self::key(provider, host, account);
-        let _guard = FILE_LOCK.lock().expect("credential file lock poisoned");
+        let mut tried = FILE_LOCK.lock().expect("credential file lock poisoned");
         let file = Self::file()?;
         match file.get(&key) {
-            // One-time migration: a token saved before the encrypted file
-            // still sits in the OS keychain. Copy it over when the keychain
-            // lets this build read it (on macOS it often won't -- then the
-            // user saves the token once more).
-            Err(CredentialError::NotFound) => {
-                let token = keyring::Entry::new(LEGACY_KEYRING_SERVICE, &key)
-                    .and_then(|e| e.get_password())
-                    .map_err(|_| CredentialError::NotFound)?;
-                file.set(&key, &token)?;
+            // Migration: a token saved before the encrypted file may still
+            // sit in the OS keychain. Try it once per key per process, so a
+            // missing token doesn't hit the keychain on every command.
+            Err(CredentialError::NotFound) if tried.insert(key.clone()) => {
+                let token = legacy_token(&key).ok_or(CredentialError::NotFound)?;
+                // A failed copy must not lose the token we just read: return
+                // it anyway and let the next read retry the copy.
+                if file.set(&key, &token).is_err() {
+                    tried.remove(&key);
+                }
                 Ok(token)
             }
             other => other,
@@ -93,11 +101,8 @@ impl CredentialStore {
         let key = Self::key(provider, host, account);
         let _guard = FILE_LOCK.lock().expect("credential file lock poisoned");
         // Drop the legacy keychain copy too, or `get`'s migration would
-        // bring a deleted token back. Best-effort: it may be absent or
-        // unreadable by this build.
-        let legacy_deleted = keyring::Entry::new(LEGACY_KEYRING_SERVICE, &key)
-            .and_then(|e| e.delete_credential())
-            .is_ok();
+        // bring a deleted token back.
+        let legacy_deleted = delete_legacy(&key);
         match Self::file()?.delete(&key) {
             Err(CredentialError::NotFound) if legacy_deleted => Ok(()),
             other => other,
@@ -105,17 +110,50 @@ impl CredentialStore {
     }
 }
 
+/// Token from the pre-encrypted-file OS keychain item, if readable.
+/// macOS: never tried. The item only trusts the build that created it (the
+/// bug this file fixes), so the read fails and can raise an access prompt.
+#[cfg(target_os = "macos")]
+fn legacy_token(_key: &str) -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn legacy_token(key: &str) -> Option<String> {
+    keyring::Entry::new(LEGACY_KEYRING_SERVICE, key)
+        .and_then(|e| e.get_password())
+        .ok()
+}
+
+/// Best-effort delete of the legacy keychain item; true if one was removed.
+#[cfg(target_os = "macos")]
+fn delete_legacy(_key: &str) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn delete_legacy(key: &str) -> bool {
+    keyring::Entry::new(LEGACY_KEYRING_SERVICE, key)
+        .and_then(|e| e.delete_credential())
+        .is_ok()
+}
+
 /// 32-byte key from SHA-256 over this machine's ID and the user's home
-/// path (separates OS users sharing a machine).
+/// path (separates OS users sharing a machine). Computed once per process:
+/// on macOS reading the ID spawns `ioreg`. A failure isn't cached.
 fn machine_key() -> Result<[u8; 32], CredentialError> {
+    if let Some(key) = MACHINE_KEY.get() {
+        return Ok(*key);
+    }
     let id = machine_uid::get().map_err(|e| CredentialError::Storage(e.to_string()))?;
-    let home = dirs::home_dir().unwrap_or_default();
+    let home = dirs::home_dir()
+        .ok_or_else(|| CredentialError::Storage("no home directory".into()))?;
     let mut h = Sha256::new();
     h.update(b"vcflow-credentials-v1\0");
     h.update(id.as_bytes());
     h.update(b"\0");
     h.update(home.as_os_str().as_encoded_bytes());
-    Ok(h.finalize().into())
+    Ok(*MACHINE_KEY.get_or_init(|| h.finalize().into()))
 }
 
 /// The encrypted token file: `nonce (12 bytes) || AES-256-GCM ciphertext`
@@ -170,12 +208,16 @@ impl CredentialFile {
         toml::from_str(&text).map_err(|_| CredentialError::Corrupt)
     }
 
-    /// A file this machine can't decrypt (copied from elsewhere, tampered)
-    /// holds nothing we can recover, so writes replace it rather than
-    /// leaving the user unable to save a token at all.
+    /// A file this machine can't decrypt (machine ID or home path changed,
+    /// copied from elsewhere, tampered) must not block saving a token, so
+    /// writes start fresh -- after moving it to `credentials.enc.bak`, so
+    /// the old tokens stay recoverable if the key comes back.
     fn load_or_empty(&self) -> Result<HashMap<String, String>, CredentialError> {
         match self.load() {
-            Err(CredentialError::Corrupt) => Ok(HashMap::new()),
+            Err(CredentialError::Corrupt) => {
+                std::fs::rename(&self.path, self.path.with_extension("enc.bak"))?;
+                Ok(HashMap::new())
+            }
             other => other,
         }
     }
@@ -199,7 +241,8 @@ fn write_private(path: &Path, data: &[u8]) -> Result<(), CredentialError> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("enc.tmp");
+    // Per-process temp name: two instances never write into the same file.
+    let tmp = path.with_extension(format!("enc.{}.tmp", std::process::id()));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -286,10 +329,17 @@ mod tests {
     fn saving_over_an_unreadable_file_starts_fresh() {
         let dir = tempfile::tempdir().unwrap();
         store(&dir, [7; 32]).set("gitlab|host|old", "lost").unwrap();
+        let unreadable = std::fs::read(dir.path().join("credentials.enc")).unwrap();
         let f = store(&dir, [8; 32]);
         f.set("gitlab|host|bob", "new").unwrap();
         assert_eq!(f.get("gitlab|host|bob").unwrap(), "new");
         assert!(matches!(f.get("gitlab|host|old"), Err(CredentialError::NotFound)));
+        // The unreadable file is kept, not destroyed: if the machine key
+        // changed, the old tokens are still recoverable from the backup.
+        let backup = std::fs::read(dir.path().join("credentials.enc.bak")).unwrap();
+        assert_eq!(backup, unreadable);
+        let old = CredentialFile::new(dir.path().join("credentials.enc.bak"), [7; 32]);
+        assert_eq!(old.get("gitlab|host|old").unwrap(), "lost");
     }
 
     #[test]

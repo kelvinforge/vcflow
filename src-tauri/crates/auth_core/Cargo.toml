@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
 thiserror = "2"
 # Token file encryption (credential_store.rs): AES-256-GCM, key derived
 # with SHA-256 from the machine ID.
@@ -16,6 +15,11 @@ toml = "0.9"
 dirs = "6"
 rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+# Only to migrate tokens saved before the encrypted credential file. Not on
+# macOS: those keychain items can't be read by newer builds anyway.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "windows-native"] }
 
 [dev-dependencies]
 tempfile = "3"
