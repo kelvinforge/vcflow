@@ -6,6 +6,7 @@ import { loadLastRepo } from "@/lib/repo"
 import { RepoHeader, RepoHealth } from "@/components/RepoHeader"
 import { SetupCard } from "@/components/SetupCard"
 import { ExistingWorkflow } from "@/components/ExistingWorkflow"
+import { UpdateNotice } from "@/components/UpdateNotice"
 
 function App() {
   const wf = useWorkflow(loadLastRepo())
@@ -67,6 +68,7 @@ function App() {
           vcflow
           <span>v{__APP_VERSION__}</span>
         </span>
+        <UpdateNotice blocked={setup.initializing || wf.inspection !== null} />
         <RepoHealth status={wf.status} />
       </footer>
     </main>
