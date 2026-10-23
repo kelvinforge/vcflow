@@ -61,7 +61,7 @@ export function TokenButton({
     wrap(async () => {
       await saveToken(repoPath, host.trim(), token.trim())
       setToken("")
-      setMsg("Saved to OS keychain.")
+      setMsg("Token saved (encrypted on this machine).")
       setView("collapsed")
       onChanged()
     })
